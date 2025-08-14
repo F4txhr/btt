@@ -2219,6 +2219,12 @@ async def main() -> None:
         .build()
     )
     
+    # Pastikan tidak ada webhook agar long polling tidak konflik
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Gagal menghapus webhook (abaikan jika tidak diset): {e}")
+    
     try:
         application.db_connection = await aiosqlite.connect('bot_database.db')
         await init_db(application.db_connection)
@@ -2356,7 +2362,28 @@ async def main() -> None:
 
     # --- Run the bot ---
     pid_file = "main_bot.pid"
-    with open(pid_file, "w") as f: f.write(str(os.getpid()))
+    # Guard single instance via pid file
+    def _is_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                old = int(f.read().strip() or 0)
+            if old and _is_running(old):
+                logger.error(f"Bot utama sudah berjalan dengan PID {old}. Keluar.")
+                return
+        except Exception:
+            pass
+        try: os.remove(pid_file)
+        except Exception: pass
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
     try:
         await application.initialize()
         await reschedule_maintenance_jobs(application)
