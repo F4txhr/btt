@@ -2444,9 +2444,10 @@ async def main() -> None:
                 return
             else:
                 try:
-                    await application.bot.send_message(chat_id=OWNER_ID, text="✅ Maintenance berhasil dimatikan otomatis. Melanjutkan startup bot utama.")
+                    await application.bot.send_message(chat_id=OWNER_ID, text="✅ Maintenance dimatikan otomatis. Proses ini akan keluar; bot utama dijalankan oleh manager.")
                 except Exception:
                     pass
+                return
     except Exception as e:
         logger.warning(f"Gagal melakukan deteksi proses maintenance: {e}")
     if os.path.exists(pid_file):
