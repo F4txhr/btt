@@ -12,6 +12,7 @@ import subprocess
 import os
 import signal
 import sys
+import pickle
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from math import radians, cos, sin, asin, sqrt
@@ -51,6 +52,7 @@ DEVELOPER_CHAT_ID = int(os.getenv("DEVELOPER_CHAT_ID", str(OWNER_ID)))
 # Global rate limiter config
 GLOBAL_RPS = int(os.getenv("GLOBAL_RPS", "25"))
 PER_CHAT_DELAY = float(os.getenv("PER_CHAT_DELAY", "1.0"))
+AUTO_KILL_DUP_BOT = os.getenv("AUTO_KILL_DUP_BOT", "true").lower() in ("1","true","yes")
 
 # Logger setup
 logging.basicConfig(
