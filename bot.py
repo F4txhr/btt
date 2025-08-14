@@ -194,22 +194,42 @@ async def trigger_manager_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Menjalankan job untuk memicu manager.py {mode}")
     subprocess.Popen(f"{sys.executable} manager.py {mode}", shell=True)
     
-async def reschedule_maintenance_jobs(context: ContextTypes.DEFAULT_TYPE):
+async def reschedule_maintenance_jobs(application: Application):
     """Membaca file job saat startup dan menjadwalkan ulang jika perlu."""
     try:
-        with open("maintenance_job.json", "r") as f: job_data = json.load(f)
+        with open("maintenance_job.json", "r") as f:
+            job_data = json.load(f)
+
         now = datetime.now(timezone.utc)
-        def schedule_if_future(job_name, callback, iso_timestamp, data={}):
-            target_time = datetime.fromisoformat(iso_timestamp)
+
+        def schedule_if_future(job_name, callback, run_at_iso, data=None):
+            if not run_at_iso:
+                return
+            target_time = datetime.fromisoformat(run_at_iso)
             if target_time > now:
                 delay = (target_time - now).total_seconds()
-                context.job_queue.run_once(callback, when=delay, name=job_name, data=data)
+                application.job_queue.run_once(callback, when=delay, name=job_name, data=data or {})
                 logger.info(f"Menjadwalkan ulang job '{job_name}' untuk berjalan dalam {delay:.0f} detik.")
 
-        schedule_if_future("maintenance_countdown", broadcast_job, job_data["countdown_at"], data={'text': job_data["countdown_text"]})
-        schedule_if_future("maintenance_on", trigger_manager_job, job_data["start_at"], data={'mode': 'on'})
-        schedule_if_future("maintenance_off", trigger_manager_job, job_data["end_at"], data={'mode': 'off'})
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        start_at = job_data.get("start_at")
+        end_at = job_data.get("end_at")
+
+        # Derive countdown_at and text if missing
+        countdown_at = job_data.get("countdown_at")
+        if not countdown_at and start_at:
+            start_dt = datetime.fromisoformat(start_at)
+            one_minute_before = start_dt - timedelta(minutes=1)
+            if one_minute_before > now:
+                countdown_at = one_minute_before.isoformat()
+
+        countdown_text = job_data.get("countdown_text") or "⏳ PERHATIAN ⏳\n\nMode pemeliharaan akan diaktifkan dalam 1 menit."
+
+        if countdown_at:
+            schedule_if_future("maintenance_countdown", broadcast_job, countdown_at, data={"text": countdown_text})
+        schedule_if_future("maintenance_on", trigger_manager_job, start_at, data={"mode": "on"})
+        schedule_if_future("maintenance_off", trigger_manager_job, end_at, data={"mode": "off"})
+    except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+        logger.info(f"Tidak ada job maintenance yang perlu dijadwalkan ulang: {e}")
         return
 
 COMMAND_LIST = [
@@ -1035,7 +1055,7 @@ async def direct_relay_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Gagal relay pesan dari {user_id} ke {partner_id}: {e}")
         await update.message.reply_text("Gagal mengirim pesan. Sesi dihentikan.")
         # Lakukan pembersihan paksa di sini
-        stop_command(update, context)
+        await stop_command(update, context)
 
 # =============================
 # FEEDBACK HANDLERS
@@ -1705,7 +1725,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
     
-    await toko_command(query, context)
+    await toko_command(update, context)
 
 # =============================
 # ADMIN HANDLERS
@@ -2065,12 +2085,14 @@ async def broadcast_startup_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_shutdown(application: Application):
     """Broadcasts a neater shutdown countdown, updating every second."""
-    db = get_db(ContextTypes.DEFAULT_TYPE(application=application))
+    db = getattr(application, 'db_connection', None)
     all_user_ids = []
-    async with db.execute("SELECT user_id FROM user_profiles") as cursor:
-        rows = await cursor.fetchall()
-    all_user_ids = [row[0] for row in rows]
-    if not all_user_ids: return
+    if db:
+        async with db.execute("SELECT user_id FROM user_profiles") as cursor:
+            rows = await cursor.fetchall()
+        all_user_ids = [row[0] for row in rows]
+    if not all_user_ids: 
+        return
 
     logger.info(f"Memulai broadcast shutdown rapi ke {len(all_user_ids)} pengguna...")
     
@@ -2270,9 +2292,9 @@ async def main() -> None:
     with open(pid_file, "w") as f: f.write(str(os.getpid()))
     try:
         await application.initialize()
-        await reschedule_maintenance_jobs(ContextTypes.DEFAULT_TYPE(application=application))
-        await application.updater.start_polling(drop_pending_updates=True)
+        await reschedule_maintenance_jobs(application)
         await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
         logger.info("Bot utama berjalan.")
         await shutdown_event.wait()
     finally:

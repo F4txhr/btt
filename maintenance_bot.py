@@ -76,8 +76,8 @@ async def main():
 
     try:
         await application.initialize()
-        await application.updater.start_polling()
         await application.start()
+        await application.updater.start_polling()
         logger.info("Bot pemeliharaan berjalan. Menunggu sinyal shutdown...")
         await shutdown_event.wait()
     finally:
