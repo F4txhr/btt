@@ -2371,7 +2371,7 @@ async def main() -> None:
             return False
         except PermissionError:
             return True
-    # Deteksi: jika maintenance_bot masih berjalan, jangan start bot utama
+    # Deteksi: jika maintenance_bot masih berjalan, tangani otomatis sebelum start
     try:
         maint_pids = set()
         maint_pid_file = "maintenance_bot.pid"
@@ -2398,8 +2398,53 @@ async def main() -> None:
         except Exception:
             pass
         if maint_pids:
-            logger.error(f"Maintenance bot masih berjalan (PID: {sorted(list(maint_pids))}). Jalankan 'python manager.py off' terlebih dahulu.")
-            return
+            # Beri tahu owner dan coba matikan otomatis
+            try:
+                await application.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ Maintenance bot terdeteksi berjalan (PID: {sorted(list(maint_pids))}). Mencoba mematikan otomatis...")
+            except Exception:
+                pass
+            try:
+                subprocess.run([sys.executable, "manager.py", "off"], check=False)
+            except Exception:
+                pass
+            # Tunggu sebentar lalu cek ulang
+            await asyncio.sleep(3)
+            re_alive = False
+            try:
+                refreshed = set()
+                if os.path.exists(maint_pid_file):
+                    try:
+                        with open(maint_pid_file, "r") as f:
+                            mpid2 = int((f.read() or "0").strip())
+                        if mpid2 and _is_running(mpid2):
+                            refreshed.add(mpid2)
+                    except Exception:
+                        pass
+                out2 = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
+                for line in out2.splitlines():
+                    if "maintenance_bot.py" in line and "grep" not in line:
+                        try:
+                            gpid = int(line.strip().split(None, 1)[0])
+                            if _is_running(gpid):
+                                refreshed.add(gpid)
+                        except Exception:
+                            continue
+                if refreshed:
+                    re_alive = True
+                    maint_pids = refreshed
+            except Exception:
+                pass
+            if re_alive:
+                try:
+                    await application.bot.send_message(chat_id=OWNER_ID, text=f"❌ Gagal mematikan maintenance otomatis. PID masih aktif: {sorted(list(maint_pids))}. Jalankan 'python manager.py off' atau kill proses secara manual.")
+                except Exception:
+                    pass
+                return
+            else:
+                try:
+                    await application.bot.send_message(chat_id=OWNER_ID, text="✅ Maintenance berhasil dimatikan otomatis. Melanjutkan startup bot utama.")
+                except Exception:
+                    pass
     except Exception as e:
         logger.warning(f"Gagal melakukan deteksi proses maintenance: {e}")
     if os.path.exists(pid_file):
