@@ -1026,6 +1026,21 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting_queue = context.bot_data.setdefault('waiting_queue', [])
     db = get_db(context)
 
+    # Drain mode: jika maintenance akan segera dimulai (< 5 menit), tolak pencarian baru
+    try:
+        with open("maintenance_info.json", "r") as f:
+            info = json.load(f)
+            end_time = info.get("end_time")
+            start_at = info.get("start_at")
+            now = datetime.now(timezone.utc)
+            if start_at:
+                start_dt = datetime.fromisoformat(start_at)
+                if (start_dt - now).total_seconds() <= 300 and (start_dt - now).total_seconds() > 0:
+                    await update.message.reply_text("⚠️ Bot memasuki mode perbaikan sebentar lagi. Pencarian baru sementara dinonaktifkan.")
+                    return
+    except Exception:
+        pass
+
     if user_id in chat_partners:
         await update.message.reply_text("**Anda sudah berada dalam sesi chat\\.**\n\nGunakan */next* atau */stop*\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -1837,7 +1852,7 @@ async def confirm_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Simpan info job ke file
     job_info = {"start_at": start_at.isoformat(), "end_at": end_at.isoformat(), "start_delay": start_str, "duration": duration_str}
     with open("maintenance_job.json", "w") as f: json.dump(job_info, f)
-    with open("maintenance_info.json", "w") as f: json.dump({"end_time": end_at.isoformat(), "duration": duration_str}, f)
+    with open("maintenance_info.json", "w") as f: json.dump({"start_at": start_at.isoformat(), "end_time": end_at.isoformat(), "duration": duration_str}, f)
 
     # 1. Kirim broadcast awal
     initial_message = (f"🔧 PENGUMUMAN 🔧\n\nBot akan memasuki mode perbaikan dalam *{start_str}* dan akan berlangsung selama *{duration_str}*.")
