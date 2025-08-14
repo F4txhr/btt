@@ -86,15 +86,41 @@ def start_process(script_name):
     else:
         log(f"PERINGATAN: {script_name} belum menulis PID dalam batas waktu. Periksa log jika terjadi masalah.")
 
+def follow_log_for(script_name):
+    """Menampilkan log real-time untuk proses tertentu (Ctrl+C untuk keluar)."""
+    log_file = f"{script_name}.log"
+    log(f"Menampilkan log real-time: {log_file} (tekan Ctrl+C untuk berhenti)")
+    try:
+        subprocess.call(f"tail -F {log_file}", shell=True)
+    except KeyboardInterrupt:
+        pass
+
+def follow_running_logs():
+    """Mengikuti log dari proses yang sedang berjalan (main/maintenance)."""
+    main_pid = get_pid_from_file(MAIN_BOT_PID_FILE)
+    maint_pid = get_pid_from_file(MAINTENANCE_BOT_PID_FILE)
+    if main_pid and _is_process_running(main_pid):
+        follow_log_for(MAIN_BOT_SCRIPT)
+    elif maint_pid and _is_process_running(maint_pid):
+        follow_log_for(MAINTENANCE_BOT_SCRIPT)
+    else:
+        log("Tidak ada proses yang berjalan untuk diikuti log-nya.")
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] not in ['on', 'off']:
-        log("ERROR: Argumen tidak valid. Gunakan 'on' atau 'off'."); sys.exit(1)
+    # Dukungan argumen: on [--follow], off [--follow], logs
+    if len(sys.argv) < 2 or sys.argv[1] not in ['on', 'off', 'logs']:
+        log("ERROR: Argumen tidak valid. Gunakan 'on [--follow]', 'off [--follow]' atau 'logs'."); sys.exit(1)
     mode = sys.argv[1]
+    follow = ('--follow' in sys.argv[2:])
+    if mode == 'logs':
+        follow_running_logs(); sys.exit(0)
     if mode == 'on':
         log("--- MENGAKTIFKAN MODE MAINTENANCE ---")
         kill_process(MAIN_BOT_PID_FILE)
         start_process(MAINTENANCE_BOT_SCRIPT)
         log("--- Mode maintenance SELESAI DIAKTIFKAN ---")
+        if follow:
+            follow_log_for(MAINTENANCE_BOT_SCRIPT)
     elif mode == 'off':
         log("--- MENONAKTIFKAN MODE MAINTENANCE ---")
         # Pastikan maintenance bot benar-benar mati
@@ -109,3 +135,5 @@ if __name__ == "__main__":
             sys.exit(1)
         start_process(MAIN_BOT_SCRIPT)
         log("--- Mode maintenance SELESAI DINONAKTIFKAN ---")
+        if follow:
+            follow_log_for(MAIN_BOT_SCRIPT)
