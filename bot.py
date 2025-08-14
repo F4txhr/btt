@@ -2371,6 +2371,37 @@ async def main() -> None:
             return False
         except PermissionError:
             return True
+    # Deteksi: jika maintenance_bot masih berjalan, jangan start bot utama
+    try:
+        maint_pids = set()
+        maint_pid_file = "maintenance_bot.pid"
+        if os.path.exists(maint_pid_file):
+            try:
+                with open(maint_pid_file, "r") as f:
+                    mpid = int((f.read() or "0").strip())
+                if mpid and _is_running(mpid):
+                    maint_pids.add(mpid)
+            except Exception:
+                pass
+        # Fallback grep via ps untuk memastikan tidak ada proses orphan
+        try:
+            out = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
+            for line in out.splitlines():
+                if "maintenance_bot.py" in line and "grep" not in line:
+                    try:
+                        pid_str = line.strip().split(None, 1)[0]
+                        gpid = int(pid_str)
+                        if _is_running(gpid):
+                            maint_pids.add(gpid)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        if maint_pids:
+            logger.error(f"Maintenance bot masih berjalan (PID: {sorted(list(maint_pids))}). Jalankan 'python manager.py off' terlebih dahulu.")
+            return
+    except Exception as e:
+        logger.warning(f"Gagal melakukan deteksi proses maintenance: {e}")
     if os.path.exists(pid_file):
         try:
             with open(pid_file, "r") as f:
