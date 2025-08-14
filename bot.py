@@ -39,6 +39,7 @@ from telegram.ext import (
     JobQueue,
     ApplicationHandlerStop,
 )
+from collections import deque
 
 # =============================
 # CONFIGURATION
@@ -46,6 +47,10 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "5361605327"))
 DEVELOPER_CHAT_ID = int(os.getenv("DEVELOPER_CHAT_ID", str(OWNER_ID)))
+
+# Global rate limiter config
+GLOBAL_RPS = int(os.getenv("GLOBAL_RPS", "25"))
+PER_CHAT_DELAY = float(os.getenv("PER_CHAT_DELAY", "1.0"))
 
 # Logger setup
 logging.basicConfig(
@@ -453,35 +458,65 @@ def reset_user_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
 
     logger.info(f"Pembersihan paksa untuk user {user_id} dan partner {partner_id}")
 
-async def safe_send_message(bot, chat_id, text, **kwargs):
-    """Safely send message with error handling. Returns the message object on success, None on failure."""
-    try:
-        # Kirim pesan dan kembalikan hasilnya
-        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-    except Exception: 
-        # Jika gagal, kembalikan None
-        return None
+_rate_lock = asyncio.Lock()
+_global_window = deque()  # timestamps of recent sends
+_last_per_chat: dict[int, float] = {}
 
-def remove_from_queue(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """Remove user from waiting queue"""
-    waiting_queue = context.bot_data.setdefault('waiting_queue', [])
-    user_in_queue = next(
-        (item for item in waiting_queue if item['user_id'] == user_id), 
-        None
-    )
-    
-    if user_in_queue:
-        waiting_queue.remove(user_in_queue)
-        return True
-    return False
-    
+async def _acquire_send_slot(chat_id: int):
+    """Acquire a send slot respecting global RPS and per-chat delay."""
+    loop = asyncio.get_running_loop()
+    while True:
+        async with _rate_lock:
+            now = loop.time()
+            # Clean global window (older than 1s)
+            while _global_window and (now - _global_window[0]) > 1.0:
+                _global_window.popleft()
+
+            # Check per-chat delay
+            last = _last_per_chat.get(chat_id, 0.0)
+            per_chat_wait = max(0.0, PER_CHAT_DELAY - (now - last))
+
+            global_ok = len(_global_window) < GLOBAL_RPS
+
+            if per_chat_wait == 0.0 and global_ok:
+                _last_per_chat[chat_id] = now
+                _global_window.append(now)
+                return
+
+            sleep_for = per_chat_wait if not global_ok else 0.05
+        await asyncio.sleep(max(0.05, sleep_for))
+
 async def safe_edit_message_text(bot, text: str, chat_id: int, message_id: int, **kwargs):
-    """Safely edit a message with error handling."""
+    """Safely edit a message with rate limit and error handling."""
     try:
+        await _acquire_send_slot(chat_id)
         await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
         return True
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, 'retry_after', 1) + 0.1)
+        try:
+            await _acquire_send_slot(chat_id)
+            await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
+            return True
+        except Exception:
+            return False
     except Exception:
         return False
+
+async def safe_send_message(bot, chat_id: int, text: str, **kwargs):
+    """Safely send message with limiter and RetryAfter handling. Returns the message object on success, None on failure."""
+    try:
+        await _acquire_send_slot(chat_id)
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, 'retry_after', 1) + 0.1)
+        try:
+            await _acquire_send_slot(chat_id)
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 async def send_broadcast_in_batches(bot, user_ids: List[int], text: str, *, parse_mode=None, batch_size: int = 25, delay_seconds: float = 1.0):
     """Send broadcast messages in batches to respect Telegram rate limits."""
@@ -1062,6 +1097,7 @@ async def direct_relay_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_chat_action(chat_id=partner_id, action=ChatAction.TYPING)
     
     try:
+        await _acquire_send_slot(partner_id)
         if message.text: await context.bot.send_message(partner_id, text=message.text)
         elif message.photo: await context.bot.send_photo(partner_id, photo=message.photo[-1].file_id, caption=message.caption)
         elif message.video: await context.bot.send_video(partner_id, video=message.video.file_id, caption=message.caption)
@@ -2327,6 +2363,18 @@ async def main() -> None:
             logger.info("Database connection closed.")
         
         logger.info("Shutdown complete.")
+
+def remove_from_queue(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Remove user from waiting queue"""
+    waiting_queue = context.bot_data.setdefault('waiting_queue', [])
+    user_in_queue = next(
+        (item for item in waiting_queue if item['user_id'] == user_id),
+        None
+    )
+    if user_in_queue:
+        waiting_queue.remove(user_in_queue)
+        return True
+    return False
 
 if __name__ == '__main__':
     # Menambahkan penanganan sinyal sistem (SIGTERM)
