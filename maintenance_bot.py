@@ -10,6 +10,7 @@ import json
 import sys
 import subprocess
 from datetime import datetime, timezone
+import fcntl, time
 
 from telegram import Update
 # PERBAIKAN: Impor ParseMode dari telegram.constants
@@ -22,6 +23,43 @@ MAINT_BOT_TOKEN = os.getenv("MAINT_BOT_TOKEN", BOT_TOKEN)
 OWNER_ID = int(os.getenv("OWNER_ID", "5361605327"))
 NAMA_CHANNEL = os.getenv("CHANNEL_USERNAME", "@todconvert_bot")
 MAINT_ALLOWLIST = set(int(x) for x in os.getenv("MAINT_ALLOWLIST", str(OWNER_ID)).split(",") if x.strip().isdigit())
+TOKEN_LOCK_FILE = os.getenv("TOKEN_LOCK_FILE", "token.lock")
+TOKEN_LOCK_WAIT_SECONDS = int(os.getenv("TOKEN_LOCK_WAIT_SECONDS", "60"))
+_token_lock_fd = None
+
+def acquire_token_lock(timeout_seconds: int = TOKEN_LOCK_WAIT_SECONDS) -> bool:
+    global _token_lock_fd
+    start_time = time.time()
+    _token_lock_fd = os.open(TOKEN_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+    while True:
+        try:
+            fcntl.flock(_token_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                os.ftruncate(_token_lock_fd, 0)
+                os.write(_token_lock_fd, str(os.getpid()).encode())
+                os.lseek(_token_lock_fd, 0, os.SEEK_SET)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            if time.time() - start_time > timeout_seconds:
+                return False
+            time.sleep(0.2)
+
+def release_token_lock():
+    global _token_lock_fd
+    try:
+        if _token_lock_fd is not None:
+            try:
+                fcntl.flock(_token_lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(_token_lock_fd)
+            except Exception:
+                pass
+    finally:
+        _token_lock_fd = None
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -131,6 +169,9 @@ async def main():
     try:
         await application.initialize()
         await application.start()
+        if not acquire_token_lock():
+            logger.error("Gagal mengakuisisi token lock untuk maintenance. Keluar.")
+            return
         await application.updater.start_polling()
         logger.info("Bot pemeliharaan berjalan. Menunggu sinyal shutdown...")
         await shutdown_event.wait()
@@ -139,6 +180,7 @@ async def main():
         if application.updater and application.updater.running: await application.updater.stop()
         if application.running: await application.stop()
         await application.shutdown()
+        release_token_lock()
         
         for f in [pid_file, "maintenance_info.json", "maintenance_job.json"]:
             if os.path.exists(f): os.remove(f)

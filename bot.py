@@ -13,6 +13,8 @@ import os
 import signal
 import sys
 import pickle
+import fcntl
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from math import radians, cos, sin, asin, sqrt
@@ -53,6 +55,9 @@ DEVELOPER_CHAT_ID = int(os.getenv("DEVELOPER_CHAT_ID", str(OWNER_ID)))
 GLOBAL_RPS = int(os.getenv("GLOBAL_RPS", "25"))
 PER_CHAT_DELAY = float(os.getenv("PER_CHAT_DELAY", "1.0"))
 AUTO_KILL_DUP_BOT = os.getenv("AUTO_KILL_DUP_BOT", "true").lower() in ("1","true","yes")
+TOKEN_LOCK_FILE = os.getenv("TOKEN_LOCK_FILE", "token.lock")
+TOKEN_LOCK_WAIT_SECONDS = int(os.getenv("TOKEN_LOCK_WAIT_SECONDS", "60"))
+_token_lock_fd = None
 
 # Logger setup
 logging.basicConfig(
@@ -2467,14 +2472,53 @@ async def main() -> None:
         await application.initialize()
         await reschedule_maintenance_jobs(application)
         await application.start()
+        # Acquire token lock before starting polling to avoid 409 with other process
+        if not acquire_token_lock():
+            logger.error("Gagal mengakuisisi token lock dalam batas waktu. Keluar.")
+            return
         await application.updater.start_polling(drop_pending_updates=True)
+        # Jadwalkan tugas startup (broadcast online dan event lain)
+        try:
+            await run_startup_tasks(application)
+        except Exception as e:
+            logger.warning(f"Gagal menjadwalkan tugas startup: {e}")
         logger.info("Bot utama berjalan.")
         await shutdown_event.wait()
     finally:
         logger.info("Memulai shutdown bot utama...")
         if application.updater and application.updater.running: await application.updater.stop()
+        # Sanitasi user_data agar persistence tidak gagal karena objek tak bisa dipickle
+        try:
+            def _sanitize(val, depth=0):
+                if depth > 5:
+                    return None
+                if isinstance(val, (str, int, float, bool)) or val is None:
+                    return val
+                if isinstance(val, list):
+                    return [x for x in (_sanitize(v, depth+1) for v in val) if x is not None]
+                if isinstance(val, tuple):
+                    return tuple([x for x in (_sanitize(v, depth+1) for v in val) if x is not None])
+                if isinstance(val, dict):
+                    newd = {}
+                    for k, v in val.items():
+                        sv = _sanitize(v, depth+1)
+                        if sv is not None:
+                            newd[k] = sv
+                    return newd
+                # fallback: drop non-serializable
+                try:
+                    pickle.dumps(val)
+                    return val
+                except Exception:
+                    return None
+            for uid in list(application.user_data.keys()):
+                application.user_data[uid] = _sanitize(application.user_data[uid])
+        except Exception:
+            pass
         if application.running: await application.stop()
         await application.shutdown()
+        # Release token lock at the end
+        release_token_lock()
         if hasattr(application, 'db_connection'): await application.db_connection.close()
         if os.path.exists(pid_file): os.remove(pid_file)
         logger.info("Bot utama telah dimatikan.")
@@ -2496,6 +2540,44 @@ def remove_from_queue(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
         waiting_queue.remove(user_in_queue)
         return True
     return False
+
+def acquire_token_lock(timeout_seconds: int = TOKEN_LOCK_WAIT_SECONDS) -> bool:
+    """Acquire exclusive token lock. Blocks until acquired or timeout. Returns True if acquired."""
+    global _token_lock_fd
+    start_time = time.time()
+    # Open or create lock file
+    _token_lock_fd = os.open(TOKEN_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+    while True:
+        try:
+            fcntl.flock(_token_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Write owner pid for observability
+            try:
+                os.ftruncate(_token_lock_fd, 0)
+                os.write(_token_lock_fd, str(os.getpid()).encode())
+                os.lseek(_token_lock_fd, 0, os.SEEK_SET)
+            except Exception:
+                pass
+            return True
+        except BlockingIOError:
+            if time.time() - start_time > timeout_seconds:
+                return False
+            time.sleep(0.2)
+
+def release_token_lock():
+    """Release the token lock if held."""
+    global _token_lock_fd
+    try:
+        if _token_lock_fd is not None:
+            try:
+                fcntl.flock(_token_lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(_token_lock_fd)
+            except Exception:
+                pass
+    finally:
+        _token_lock_fd = None
 
 if __name__ == '__main__':
     # Menambahkan penanganan sinyal sistem (SIGTERM)
