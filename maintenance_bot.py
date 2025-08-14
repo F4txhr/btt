@@ -17,9 +17,9 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- KONFIGURASI ---
-BOT_TOKEN = "7872111732:AAEbwXGvPVvHZHGSexGDzQRhBu3Axr0cWBQ"
-OWNER_ID = 5361605327
-NAMA_CHANNEL = "@todconvert_bot"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "5361605327"))
+NAMA_CHANNEL = os.getenv("CHANNEL_USERNAME", "@todconvert_bot")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)

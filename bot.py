@@ -43,9 +43,9 @@ from telegram.ext import (
 # =============================
 # CONFIGURATION
 # =============================
-BOT_TOKEN = "7872111732:AAEbwXGvPVvHZHGSexGDzQRhBu3Axr0cWBQ"
-OWNER_ID = 5361605327
-DEVELOPER_CHAT_ID = OWNER_ID 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "5361605327"))
+DEVELOPER_CHAT_ID = int(os.getenv("DEVELOPER_CHAT_ID", str(OWNER_ID)))
 
 # Logger setup
 logging.basicConfig(
@@ -183,8 +183,7 @@ async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
     if not all_user_ids: return
     
     escaped_text = escape_md(text_to_send)
-    tasks = [safe_send_message(context.bot, uid, escaped_text, parse_mode=ParseMode.MARKDOWN_V2) for uid in all_user_ids]
-    await asyncio.gather(*tasks)
+    await send_broadcast_in_batches(context.bot, all_user_ids, escaped_text, parse_mode=ParseMode.MARKDOWN_V2)
     logger.info(f"Broadcast job ke {len(all_user_ids)} pengguna selesai.")
 
     
@@ -483,6 +482,23 @@ async def safe_edit_message_text(bot, text: str, chat_id: int, message_id: int, 
         return True
     except Exception:
         return False
+
+async def send_broadcast_in_batches(bot, user_ids: List[int], text: str, *, parse_mode=None, batch_size: int = 25, delay_seconds: float = 1.0):
+    """Send broadcast messages in batches to respect Telegram rate limits."""
+    for idx in range(0, len(user_ids), batch_size):
+        chunk = user_ids[idx: idx + batch_size]
+        await asyncio.gather(*[safe_send_message(bot, uid, text, parse_mode=parse_mode) for uid in chunk])
+        if idx + batch_size < len(user_ids):
+            await asyncio.sleep(delay_seconds)
+
+async def edit_broadcast_in_batches(bot, text: str, id_to_msg_id: dict[int, int], *, batch_size: int = 25, inter_chunk_delay: float = 0.2, **kwargs):
+    """Edit broadcast messages in batches to respect rate limits."""
+    items = list(id_to_msg_id.items())
+    for idx in range(0, len(items), batch_size):
+        chunk = items[idx: idx + batch_size]
+        await asyncio.gather(*[safe_edit_message_text(bot, text, uid, mid, **kwargs) for uid, mid in chunk])
+        if idx + batch_size < len(items):
+            await asyncio.sleep(inter_chunk_delay)
 
 # =============================
 # COMMAND HANDLERS
@@ -1252,7 +1268,7 @@ async def feedback_close_callback(update: Update, context: ContextTypes.DEFAULT_
 # GANTI TOTAL FUNGSI set_filter_command ANDA DENGAN INI
 
 @auto_update_profile
-async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE, is_edit: bool = False) -> int:
     """Memulai atau menampilkan menu utama untuk mengatur filter premium."""
     user_id = update.effective_user.id
     db = get_db(context)
@@ -1265,7 +1281,7 @@ async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     profile = await get_user_profile_data(db, user_id)
     if not profile: return ConversationHandler.END
-
+    
     # --- PERBAIKAN DI SINI ---
     def format_interests(s: Optional[str]) -> str:
         # Jika s adalah None atau string kosong, langsung kembalikan 'Apapun'
@@ -1278,7 +1294,7 @@ async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⚙️ *Atur Filter Pencarian Premium*\n\n"
         "Gunakan menu di bawah untuk mengatur preferensi pencarian Anda\\.\n\n"
         f"\\- Gender Dicari: *{escape_md((profile.get('filter_gender') or 'Apapun').capitalize())}*\n"
-        f"\\- Rentang Usia: *{profile.get('filter_age_min') or 'N/A'} \\- {profile.get('filter_age_max') or 'N/A'}*\n"
+        f"\\- Rentang Usia: *{profile.get('filter_age_min') or 'N/A'} \\ - {profile.get('filter_age_max') or 'N/A'}*\n"
         f"\\- Minat Dicari: *{escape_md(format_interests(profile.get('filter_interests')))}*\n"
         f"\\- Jarak Maksimal: *{f'{profile.get("filter_distance_km")} km' if profile.get('filter_distance_km') else 'N/A'}*\n"
     )
@@ -2078,8 +2094,7 @@ async def broadcast_startup_job(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Memulai broadcast startup ke {len(all_user_ids)} pengguna...")
     startup_text = escape_md("✅ Bot Kembali Online ✅\n\nTerima kasih telah menunggu! Bot sekarang sudah aktif dan siap digunakan kembali. Selamat mengobrol!")
-    tasks = [safe_send_message(context.bot, uid, startup_text, parse_mode=ParseMode.MARKDOWN_V2) for uid in all_user_ids]
-    await asyncio.gather(*tasks)
+    await send_broadcast_in_batches(context.bot, all_user_ids, startup_text, parse_mode=ParseMode.MARKDOWN_V2)
     logger.info("Broadcast startup selesai.")
 
 
@@ -2099,43 +2114,44 @@ async def broadcast_shutdown(application: Application):
     broadcast_messages = {}
     countdown_seconds = 10
     
-    # --- PERBAIKAN 1: MENGGUNAKAN TEKS BIASA YANG AMAN ---
     initial_text = f"🔧 PENGUMUMAN 🔧\n\nBot akan segera offline untuk pemeliharaan. Shutdown dalam: {countdown_seconds} detik."
-    
-    sent_messages = await asyncio.gather(
-        *[safe_send_message(application.bot, uid, initial_text) for uid in all_user_ids]
-    )
-    
-    for i, msg in enumerate(sent_messages):
-        if msg: broadcast_messages[all_user_ids[i]] = msg.message_id
 
-    # --- PERBAIKAN 2: MENGHAPUS 'INTERVALS' AGAR SEMUA DETIK DITAMPILKAN ---
-    for i in range(countdown_seconds - 1, 0, -1): # Loop dari 9 ke 1
-        await asyncio.sleep(1)
-        # Tidak ada lagi 'if i in intervals', jadi ini akan berjalan setiap detik
-        text = f"🔧 PENGUMUMAN 🔧\n\nBot akan segera offline untuk pemeliharaan. Shutdown dalam: {i} detik."
-        await asyncio.gather(
-            *[safe_edit_message_text(application.bot, text, uid, mid) for uid, mid in broadcast_messages.items()]
+    # Kirim pesan awal dalam batch dan simpan message_id
+    batch_size = 25
+    for idx in range(0, len(all_user_ids), batch_size):
+        chunk = all_user_ids[idx: idx + batch_size]
+        sent_messages = await asyncio.gather(
+            *[safe_send_message(application.bot, uid, initial_text) for uid in chunk]
         )
+        for j, msg in enumerate(sent_messages):
+            if msg:
+                broadcast_messages[chunk[j]] = msg.message_id
+        if idx + batch_size < len(all_user_ids):
+            await asyncio.sleep(1)
 
-    # Menampilkan pesan "0 detik" atau "Shutdown..." sebelum pesan final
+    # Update countdown tiap detik, edit pesan dalam batch
+    for i in range(countdown_seconds - 1, 0, -1):
+        await asyncio.sleep(1)
+        text = f"🔧 PENGUMUMAN 🔧\n\nBot akan segera offline untuk pemeliharaan. Shutdown dalam: {i} detik."
+        await edit_broadcast_in_batches(application.bot, text, broadcast_messages)
+
     await asyncio.sleep(1)
     final_countdown_text = "🔧 PENGUMUMAN 🔧\n\nBot sedang dalam proses shutdown..."
-    await asyncio.gather(
-        *[safe_edit_message_text(application.bot, final_countdown_text, uid, mid) for uid, mid in broadcast_messages.items()]
-    )
-    await asyncio.sleep(0.5) # Jeda singkat
+    await edit_broadcast_in_batches(application.bot, final_countdown_text, broadcast_messages)
+    await asyncio.sleep(0.5)
 
-    # --- PERBAIKAN 3: MEMPERBAIKI NameError DENGAN LOOP YANG BENAR ---
     final_text = "Bot sedang offline. Sampai jumpa lagi! 👋"
-    await asyncio.gather(
-        *[safe_send_message(application.bot, uid, final_text) for uid in all_user_ids]
-    )
+    await send_broadcast_in_batches(application.bot, all_user_ids, final_text)
     
-    # Hapus pesan countdown setelah selesai
-    await asyncio.gather(
-        *[application.bot.delete_message(chat_id=uid, message_id=mid) for uid, mid in broadcast_messages.items()]
-    )
+    # Hapus pesan countdown dalam batch
+    items = list(broadcast_messages.items())
+    for idx in range(0, len(items), batch_size):
+        chunk = items[idx: idx + batch_size]
+        await asyncio.gather(
+            *[application.bot.delete_message(chat_id=uid, message_id=mid) for uid, mid in chunk]
+        )
+        if idx + batch_size < len(items):
+            await asyncio.sleep(1)
     logger.info("Broadcast shutdown selesai.")
 
 # =============================
