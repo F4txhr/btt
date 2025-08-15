@@ -12,6 +12,9 @@ import subprocess
 import os
 import signal
 import sys
+import pickle
+import fcntl
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from math import radians, cos, sin, asin, sqrt
@@ -39,13 +42,22 @@ from telegram.ext import (
     JobQueue,
     ApplicationHandlerStop,
 )
+from collections import deque
 
 # =============================
 # CONFIGURATION
 # =============================
-BOT_TOKEN = "7872111732:AAEbwXGvPVvHZHGSexGDzQRhBu3Axr0cWBQ"
-OWNER_ID = 5361605327
-DEVELOPER_CHAT_ID = OWNER_ID 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "5361605327"))
+DEVELOPER_CHAT_ID = int(os.getenv("DEVELOPER_CHAT_ID", str(OWNER_ID)))
+
+# Global rate limiter config
+GLOBAL_RPS = int(os.getenv("GLOBAL_RPS", "25"))
+PER_CHAT_DELAY = float(os.getenv("PER_CHAT_DELAY", "1.0"))
+AUTO_KILL_DUP_BOT = os.getenv("AUTO_KILL_DUP_BOT", "true").lower() in ("1","true","yes")
+TOKEN_LOCK_FILE = os.getenv("TOKEN_LOCK_FILE", "token.lock")
+TOKEN_LOCK_WAIT_SECONDS = int(os.getenv("TOKEN_LOCK_WAIT_SECONDS", "60"))
+_token_lock_fd = None
 
 # Logger setup
 logging.basicConfig(
@@ -183,8 +195,7 @@ async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
     if not all_user_ids: return
     
     escaped_text = escape_md(text_to_send)
-    tasks = [safe_send_message(context.bot, uid, escaped_text, parse_mode=ParseMode.MARKDOWN_V2) for uid in all_user_ids]
-    await asyncio.gather(*tasks)
+    await send_broadcast_in_batches(context.bot, all_user_ids, escaped_text, parse_mode=ParseMode.MARKDOWN_V2)
     logger.info(f"Broadcast job ke {len(all_user_ids)} pengguna selesai.")
 
     
@@ -194,22 +205,42 @@ async def trigger_manager_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Menjalankan job untuk memicu manager.py {mode}")
     subprocess.Popen(f"{sys.executable} manager.py {mode}", shell=True)
     
-async def reschedule_maintenance_jobs(context: ContextTypes.DEFAULT_TYPE):
+async def reschedule_maintenance_jobs(application: Application):
     """Membaca file job saat startup dan menjadwalkan ulang jika perlu."""
     try:
-        with open("maintenance_job.json", "r") as f: job_data = json.load(f)
+        with open("maintenance_job.json", "r") as f:
+            job_data = json.load(f)
+
         now = datetime.now(timezone.utc)
-        def schedule_if_future(job_name, callback, iso_timestamp, data={}):
-            target_time = datetime.fromisoformat(iso_timestamp)
+
+        def schedule_if_future(job_name, callback, run_at_iso, data=None):
+            if not run_at_iso:
+                return
+            target_time = datetime.fromisoformat(run_at_iso)
             if target_time > now:
                 delay = (target_time - now).total_seconds()
-                context.job_queue.run_once(callback, when=delay, name=job_name, data=data)
+                application.job_queue.run_once(callback, when=delay, name=job_name, data=data or {})
                 logger.info(f"Menjadwalkan ulang job '{job_name}' untuk berjalan dalam {delay:.0f} detik.")
 
-        schedule_if_future("maintenance_countdown", broadcast_job, job_data["countdown_at"], data={'text': job_data["countdown_text"]})
-        schedule_if_future("maintenance_on", trigger_manager_job, job_data["start_at"], data={'mode': 'on'})
-        schedule_if_future("maintenance_off", trigger_manager_job, job_data["end_at"], data={'mode': 'off'})
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        start_at = job_data.get("start_at")
+        end_at = job_data.get("end_at")
+
+        # Derive countdown_at and text if missing
+        countdown_at = job_data.get("countdown_at")
+        if not countdown_at and start_at:
+            start_dt = datetime.fromisoformat(start_at)
+            one_minute_before = start_dt - timedelta(minutes=1)
+            if one_minute_before > now:
+                countdown_at = one_minute_before.isoformat()
+
+        countdown_text = job_data.get("countdown_text") or "⏳ PERHATIAN ⏳\n\nMode pemeliharaan akan diaktifkan dalam 1 menit."
+
+        if countdown_at:
+            schedule_if_future("maintenance_countdown", broadcast_job, countdown_at, data={"text": countdown_text})
+        schedule_if_future("maintenance_on", trigger_manager_job, start_at, data={"mode": "on"})
+        schedule_if_future("maintenance_off", trigger_manager_job, end_at, data={"mode": "off"})
+    except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+        logger.info(f"Tidak ada job maintenance yang perlu dijadwalkan ulang: {e}")
         return
 
 COMMAND_LIST = [
@@ -434,35 +465,82 @@ def reset_user_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
 
     logger.info(f"Pembersihan paksa untuk user {user_id} dan partner {partner_id}")
 
-async def safe_send_message(bot, chat_id, text, **kwargs):
-    """Safely send message with error handling. Returns the message object on success, None on failure."""
-    try:
-        # Kirim pesan dan kembalikan hasilnya
-        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-    except Exception: 
-        # Jika gagal, kembalikan None
-        return None
+_rate_lock = asyncio.Lock()
+_global_window = deque()  # timestamps of recent sends
+_last_per_chat: dict[int, float] = {}
 
-def remove_from_queue(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """Remove user from waiting queue"""
-    waiting_queue = context.bot_data.setdefault('waiting_queue', [])
-    user_in_queue = next(
-        (item for item in waiting_queue if item['user_id'] == user_id), 
-        None
-    )
-    
-    if user_in_queue:
-        waiting_queue.remove(user_in_queue)
-        return True
-    return False
-    
+async def _acquire_send_slot(chat_id: int):
+    """Acquire a send slot respecting global RPS and per-chat delay."""
+    loop = asyncio.get_running_loop()
+    while True:
+        async with _rate_lock:
+            now = loop.time()
+            # Clean global window (older than 1s)
+            while _global_window and (now - _global_window[0]) > 1.0:
+                _global_window.popleft()
+
+            # Check per-chat delay
+            last = _last_per_chat.get(chat_id, 0.0)
+            per_chat_wait = max(0.0, PER_CHAT_DELAY - (now - last))
+
+            global_ok = len(_global_window) < GLOBAL_RPS
+
+            if per_chat_wait == 0.0 and global_ok:
+                _last_per_chat[chat_id] = now
+                _global_window.append(now)
+                return
+
+            sleep_for = per_chat_wait if not global_ok else 0.05
+        await asyncio.sleep(max(0.05, sleep_for))
+
 async def safe_edit_message_text(bot, text: str, chat_id: int, message_id: int, **kwargs):
-    """Safely edit a message with error handling."""
+    """Safely edit a message with rate limit and error handling."""
     try:
+        await _acquire_send_slot(chat_id)
         await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
         return True
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, 'retry_after', 1) + 0.1)
+        try:
+            await _acquire_send_slot(chat_id)
+            await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
+            return True
+        except Exception:
+            return False
     except Exception:
         return False
+
+async def safe_send_message(bot, chat_id: int, text: str, **kwargs):
+    """Safely send message with limiter and RetryAfter handling. Returns the message object on success, None on failure."""
+    try:
+        await _acquire_send_slot(chat_id)
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except RetryAfter as e:
+        await asyncio.sleep(getattr(e, 'retry_after', 1) + 0.1)
+        try:
+            await _acquire_send_slot(chat_id)
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+async def send_broadcast_in_batches(bot, user_ids: List[int], text: str, *, parse_mode=None, batch_size: int = 25, delay_seconds: float = 1.0):
+    """Send broadcast messages in batches to respect Telegram rate limits."""
+    for idx in range(0, len(user_ids), batch_size):
+        chunk = user_ids[idx: idx + batch_size]
+        await asyncio.gather(*[safe_send_message(bot, uid, text, parse_mode=parse_mode) for uid in chunk])
+        if idx + batch_size < len(user_ids):
+            await asyncio.sleep(delay_seconds)
+
+async def edit_broadcast_in_batches(bot, text: str, id_to_msg_id: dict[int, int], *, batch_size: int = 25, inter_chunk_delay: float = 0.2, **kwargs):
+    """Edit broadcast messages in batches to respect rate limits."""
+    items = list(id_to_msg_id.items())
+    for idx in range(0, len(items), batch_size):
+        chunk = items[idx: idx + batch_size]
+        await asyncio.gather(*[safe_edit_message_text(bot, text, uid, mid, **kwargs) for uid, mid in chunk])
+        if idx + batch_size < len(items):
+            await asyncio.sleep(inter_chunk_delay)
 
 # =============================
 # COMMAND HANDLERS
@@ -955,6 +1033,21 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting_queue = context.bot_data.setdefault('waiting_queue', [])
     db = get_db(context)
 
+    # Drain mode: jika maintenance akan segera dimulai (< 5 menit), tolak pencarian baru
+    try:
+        with open("maintenance_info.json", "r") as f:
+            info = json.load(f)
+            end_time = info.get("end_time")
+            start_at = info.get("start_at")
+            now = datetime.now(timezone.utc)
+            if start_at:
+                start_dt = datetime.fromisoformat(start_at)
+                if (start_dt - now).total_seconds() <= 300 and (start_dt - now).total_seconds() > 0:
+                    await update.message.reply_text("⚠️ Bot memasuki mode perbaikan sebentar lagi. Pencarian baru sementara dinonaktifkan.")
+                    return
+    except Exception:
+        pass
+
     if user_id in chat_partners:
         await update.message.reply_text("**Anda sudah berada dalam sesi chat\\.**\n\nGunakan */next* atau */stop*\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -1026,6 +1119,7 @@ async def direct_relay_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_chat_action(chat_id=partner_id, action=ChatAction.TYPING)
     
     try:
+        await _acquire_send_slot(partner_id)
         if message.text: await context.bot.send_message(partner_id, text=message.text)
         elif message.photo: await context.bot.send_photo(partner_id, photo=message.photo[-1].file_id, caption=message.caption)
         elif message.video: await context.bot.send_video(partner_id, video=message.video.file_id, caption=message.caption)
@@ -1035,7 +1129,7 @@ async def direct_relay_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Gagal relay pesan dari {user_id} ke {partner_id}: {e}")
         await update.message.reply_text("Gagal mengirim pesan. Sesi dihentikan.")
         # Lakukan pembersihan paksa di sini
-        stop_command(update, context)
+        await stop_command(update, context)
 
 # =============================
 # FEEDBACK HANDLERS
@@ -1232,7 +1326,7 @@ async def feedback_close_callback(update: Update, context: ContextTypes.DEFAULT_
 # GANTI TOTAL FUNGSI set_filter_command ANDA DENGAN INI
 
 @auto_update_profile
-async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE, is_edit: bool = False) -> int:
     """Memulai atau menampilkan menu utama untuk mengatur filter premium."""
     user_id = update.effective_user.id
     db = get_db(context)
@@ -1245,7 +1339,7 @@ async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     profile = await get_user_profile_data(db, user_id)
     if not profile: return ConversationHandler.END
-
+    
     # --- PERBAIKAN DI SINI ---
     def format_interests(s: Optional[str]) -> str:
         # Jika s adalah None atau string kosong, langsung kembalikan 'Apapun'
@@ -1258,7 +1352,7 @@ async def set_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⚙️ *Atur Filter Pencarian Premium*\n\n"
         "Gunakan menu di bawah untuk mengatur preferensi pencarian Anda\\.\n\n"
         f"\\- Gender Dicari: *{escape_md((profile.get('filter_gender') or 'Apapun').capitalize())}*\n"
-        f"\\- Rentang Usia: *{profile.get('filter_age_min') or 'N/A'} \\- {profile.get('filter_age_max') or 'N/A'}*\n"
+        f"\\- Rentang Usia: *{profile.get('filter_age_min') or 'N/A'} \\ - {profile.get('filter_age_max') or 'N/A'}*\n"
         f"\\- Minat Dicari: *{escape_md(format_interests(profile.get('filter_interests')))}*\n"
         f"\\- Jarak Maksimal: *{f'{profile.get("filter_distance_km")} km' if profile.get('filter_distance_km') else 'N/A'}*\n"
     )
@@ -1705,7 +1799,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
     
-    await toko_command(query, context)
+    await toko_command(update, context)
 
 # =============================
 # ADMIN HANDLERS
@@ -1765,7 +1859,7 @@ async def confirm_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Simpan info job ke file
     job_info = {"start_at": start_at.isoformat(), "end_at": end_at.isoformat(), "start_delay": start_str, "duration": duration_str}
     with open("maintenance_job.json", "w") as f: json.dump(job_info, f)
-    with open("maintenance_info.json", "w") as f: json.dump({"end_time": end_at.isoformat(), "duration": duration_str}, f)
+    with open("maintenance_info.json", "w") as f: json.dump({"start_at": start_at.isoformat(), "end_time": end_at.isoformat(), "duration": duration_str}, f)
 
     # 1. Kirim broadcast awal
     initial_message = (f"🔧 PENGUMUMAN 🔧\n\nBot akan memasuki mode perbaikan dalam *{start_str}* dan akan berlangsung selama *{duration_str}*.")
@@ -2058,62 +2152,64 @@ async def broadcast_startup_job(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"Memulai broadcast startup ke {len(all_user_ids)} pengguna...")
     startup_text = escape_md("✅ Bot Kembali Online ✅\n\nTerima kasih telah menunggu! Bot sekarang sudah aktif dan siap digunakan kembali. Selamat mengobrol!")
-    tasks = [safe_send_message(context.bot, uid, startup_text, parse_mode=ParseMode.MARKDOWN_V2) for uid in all_user_ids]
-    await asyncio.gather(*tasks)
+    await send_broadcast_in_batches(context.bot, all_user_ids, startup_text, parse_mode=ParseMode.MARKDOWN_V2)
     logger.info("Broadcast startup selesai.")
 
 
 async def broadcast_shutdown(application: Application):
     """Broadcasts a neater shutdown countdown, updating every second."""
-    db = get_db(ContextTypes.DEFAULT_TYPE(application=application))
+    db = getattr(application, 'db_connection', None)
     all_user_ids = []
-    async with db.execute("SELECT user_id FROM user_profiles") as cursor:
-        rows = await cursor.fetchall()
-    all_user_ids = [row[0] for row in rows]
-    if not all_user_ids: return
+    if db:
+        async with db.execute("SELECT user_id FROM user_profiles") as cursor:
+            rows = await cursor.fetchall()
+        all_user_ids = [row[0] for row in rows]
+    if not all_user_ids: 
+        return
 
     logger.info(f"Memulai broadcast shutdown rapi ke {len(all_user_ids)} pengguna...")
     
     broadcast_messages = {}
     countdown_seconds = 10
     
-    # --- PERBAIKAN 1: MENGGUNAKAN TEKS BIASA YANG AMAN ---
     initial_text = f"🔧 PENGUMUMAN 🔧\n\nBot akan segera offline untuk pemeliharaan. Shutdown dalam: {countdown_seconds} detik."
-    
-    sent_messages = await asyncio.gather(
-        *[safe_send_message(application.bot, uid, initial_text) for uid in all_user_ids]
-    )
-    
-    for i, msg in enumerate(sent_messages):
-        if msg: broadcast_messages[all_user_ids[i]] = msg.message_id
 
-    # --- PERBAIKAN 2: MENGHAPUS 'INTERVALS' AGAR SEMUA DETIK DITAMPILKAN ---
-    for i in range(countdown_seconds - 1, 0, -1): # Loop dari 9 ke 1
-        await asyncio.sleep(1)
-        # Tidak ada lagi 'if i in intervals', jadi ini akan berjalan setiap detik
-        text = f"🔧 PENGUMUMAN 🔧\n\nBot akan segera offline untuk pemeliharaan. Shutdown dalam: {i} detik."
-        await asyncio.gather(
-            *[safe_edit_message_text(application.bot, text, uid, mid) for uid, mid in broadcast_messages.items()]
+    # Kirim pesan awal dalam batch dan simpan message_id
+    batch_size = 25
+    for idx in range(0, len(all_user_ids), batch_size):
+        chunk = all_user_ids[idx: idx + batch_size]
+        sent_messages = await asyncio.gather(
+            *[safe_send_message(application.bot, uid, initial_text) for uid in chunk]
         )
+        for j, msg in enumerate(sent_messages):
+            if msg:
+                broadcast_messages[chunk[j]] = msg.message_id
+        if idx + batch_size < len(all_user_ids):
+            await asyncio.sleep(1)
 
-    # Menampilkan pesan "0 detik" atau "Shutdown..." sebelum pesan final
+    # Update countdown tiap detik, edit pesan dalam batch
+    for i in range(countdown_seconds - 1, 0, -1):
+        await asyncio.sleep(1)
+        text = f"🔧 PENGUMUMAN 🔧\n\nBot akan segera offline untuk pemeliharaan. Shutdown dalam: {i} detik."
+        await edit_broadcast_in_batches(application.bot, text, broadcast_messages)
+
     await asyncio.sleep(1)
     final_countdown_text = "🔧 PENGUMUMAN 🔧\n\nBot sedang dalam proses shutdown..."
-    await asyncio.gather(
-        *[safe_edit_message_text(application.bot, final_countdown_text, uid, mid) for uid, mid in broadcast_messages.items()]
-    )
-    await asyncio.sleep(0.5) # Jeda singkat
+    await edit_broadcast_in_batches(application.bot, final_countdown_text, broadcast_messages)
+    await asyncio.sleep(0.5)
 
-    # --- PERBAIKAN 3: MEMPERBAIKI NameError DENGAN LOOP YANG BENAR ---
     final_text = "Bot sedang offline. Sampai jumpa lagi! 👋"
-    await asyncio.gather(
-        *[safe_send_message(application.bot, uid, final_text) for uid in all_user_ids]
-    )
+    await send_broadcast_in_batches(application.bot, all_user_ids, final_text)
     
-    # Hapus pesan countdown setelah selesai
-    await asyncio.gather(
-        *[application.bot.delete_message(chat_id=uid, message_id=mid) for uid, mid in broadcast_messages.items()]
-    )
+    # Hapus pesan countdown dalam batch
+    items = list(broadcast_messages.items())
+    for idx in range(0, len(items), batch_size):
+        chunk = items[idx: idx + batch_size]
+        await asyncio.gather(
+            *[application.bot.delete_message(chat_id=uid, message_id=mid) for uid, mid in chunk]
+        )
+        if idx + batch_size < len(items):
+            await asyncio.sleep(1)
     logger.info("Broadcast shutdown selesai.")
 
 # =============================
@@ -2129,6 +2225,12 @@ async def main() -> None:
         .persistence(PicklePersistence(filepath="bot_persistence.pkl"))
         .build()
     )
+    
+    # Pastikan tidak ada webhook agar long polling tidak konflik
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Gagal menghapus webhook (abaikan jika tidak diset): {e}")
     
     try:
         application.db_connection = await aiosqlite.connect('bot_database.db')
@@ -2267,19 +2369,155 @@ async def main() -> None:
 
     # --- Run the bot ---
     pid_file = "main_bot.pid"
-    with open(pid_file, "w") as f: f.write(str(os.getpid()))
+    # Guard single instance via pid file
+    def _is_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    # Deteksi: jika maintenance_bot masih berjalan, tangani otomatis sebelum start
+    try:
+        # Debounce agar hanya sekali per startup
+        if not hasattr(application, 'auto_kill_maint_done'):
+            application.auto_kill_maint_done = False
+        maint_pids = set()
+        maint_pid_file = "maintenance_bot.pid"
+        if os.path.exists(maint_pid_file):
+            try:
+                with open(maint_pid_file, "r") as f:
+                    mpid = int((f.read() or "0").strip())
+                if mpid and _is_running(mpid):
+                    maint_pids.add(mpid)
+            except Exception:
+                pass
+        if maint_pids and not application.auto_kill_maint_done:
+            # Beri tahu owner dan coba matikan otomatis
+            try:
+                await application.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ Maintenance bot terdeteksi berjalan (PID: {sorted(list(maint_pids))}). Mencoba mematikan otomatis...")
+            except Exception:
+                pass
+            try:
+                subprocess.run([sys.executable, "manager.py", "off"], check=False)
+            except Exception:
+                pass
+            # Poll hingga 30 detik menunggu benar-benar mati
+            deadline = time.time() + 30
+            still_alive = False
+            while time.time() < deadline:
+                refreshed = set()
+                try:
+                    if os.path.exists(maint_pid_file):
+                        with open(maint_pid_file, "r") as f:
+                            mpid2 = int((f.read() or "0").strip())
+                        if mpid2 and _is_running(mpid2):
+                            refreshed.add(mpid2)
+                except Exception:
+                    pass
+                if not refreshed:
+                    still_alive = False
+                    break
+                still_alive = True
+                await asyncio.sleep(1)
+            # Jika masih hidup, kirim SIGKILL ke semua yang terdeteksi
+            if still_alive:
+                for pid in list(maint_pids):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
+                # Cek terakhir
+                refreshed_final = set()
+                try:
+                    if os.path.exists(maint_pid_file):
+                        with open(maint_pid_file, "r") as f:
+                            mpid3 = int((f.read() or "0").strip())
+                        if mpid3 and _is_running(mpid3):
+                            refreshed_final.add(mpid3)
+                except Exception:
+                    pass
+                if refreshed_final:
+                    try:
+                        await application.bot.send_message(chat_id=OWNER_ID, text=f"❌ Gagal mematikan maintenance otomatis. PID masih aktif: {sorted(list(refreshed_final))}. Jalankan 'python manager.py off' atau kill proses secara manual.")
+                    except Exception:
+                        pass
+                    return
+            # Sukses dimatikan
+            application.auto_kill_maint_done = True
+            try:
+                await application.bot.send_message(chat_id=OWNER_ID, text="✅ Maintenance dimatikan otomatis. Proses ini akan keluar; bot utama dijalankan oleh manager.")
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        logger.warning(f"Gagal melakukan deteksi proses maintenance: {e}")
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                old = int(f.read().strip() or 0)
+            if old and _is_running(old):
+                logger.error(f"Bot utama sudah berjalan dengan PID {old}. Keluar.")
+                return
+        except Exception:
+            pass
+        try: os.remove(pid_file)
+        except Exception: pass
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
     try:
         await application.initialize()
-        await reschedule_maintenance_jobs(ContextTypes.DEFAULT_TYPE(application=application))
-        await application.updater.start_polling(drop_pending_updates=True)
+        await reschedule_maintenance_jobs(application)
         await application.start()
+        # Acquire token lock before starting polling to avoid 409 with other process
+        if not acquire_token_lock():
+            logger.error("Gagal mengakuisisi token lock dalam batas waktu. Keluar.")
+            return
+        await application.updater.start_polling(drop_pending_updates=True)
+        # Jadwalkan tugas startup (broadcast online dan event lain)
+        try:
+            await run_startup_tasks(application)
+        except Exception as e:
+            logger.warning(f"Gagal menjadwalkan tugas startup: {e}")
         logger.info("Bot utama berjalan.")
         await shutdown_event.wait()
     finally:
         logger.info("Memulai shutdown bot utama...")
         if application.updater and application.updater.running: await application.updater.stop()
+        # Sanitasi user_data agar persistence tidak gagal karena objek tak bisa dipickle
+        try:
+            def _sanitize(val, depth=0):
+                if depth > 5:
+                    return None
+                if isinstance(val, (str, int, float, bool)) or val is None:
+                    return val
+                if isinstance(val, list):
+                    return [x for x in (_sanitize(v, depth+1) for v in val) if x is not None]
+                if isinstance(val, tuple):
+                    return tuple([x for x in (_sanitize(v, depth+1) for v in val) if x is not None])
+                if isinstance(val, dict):
+                    newd = {}
+                    for k, v in val.items():
+                        sv = _sanitize(v, depth+1)
+                        if sv is not None:
+                            newd[k] = sv
+                    return newd
+                # fallback: drop non-serializable
+                try:
+                    pickle.dumps(val)
+                    return val
+                except Exception:
+                    return None
+            for uid in list(application.user_data.keys()):
+                application.user_data[uid] = _sanitize(application.user_data[uid])
+        except Exception:
+            pass
         if application.running: await application.stop()
         await application.shutdown()
+        # Release token lock at the end
+        release_token_lock()
         if hasattr(application, 'db_connection'): await application.db_connection.close()
         if os.path.exists(pid_file): os.remove(pid_file)
         logger.info("Bot utama telah dimatikan.")
@@ -2289,6 +2527,56 @@ async def main() -> None:
             logger.info("Database connection closed.")
         
         logger.info("Shutdown complete.")
+
+def remove_from_queue(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Remove user from waiting queue"""
+    waiting_queue = context.bot_data.setdefault('waiting_queue', [])
+    user_in_queue = next(
+        (item for item in waiting_queue if item['user_id'] == user_id),
+        None
+    )
+    if user_in_queue:
+        waiting_queue.remove(user_in_queue)
+        return True
+    return False
+
+def acquire_token_lock(timeout_seconds: int = TOKEN_LOCK_WAIT_SECONDS) -> bool:
+    """Acquire exclusive token lock. Blocks until acquired or timeout. Returns True if acquired."""
+    global _token_lock_fd
+    start_time = time.time()
+    # Open or create lock file
+    _token_lock_fd = os.open(TOKEN_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+    while True:
+        try:
+            fcntl.flock(_token_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Write owner pid for observability
+            try:
+                os.ftruncate(_token_lock_fd, 0)
+                os.write(_token_lock_fd, str(os.getpid()).encode())
+                os.lseek(_token_lock_fd, 0, os.SEEK_SET)
+            except Exception:
+                pass
+            return True
+        except BlockingIOError:
+            if time.time() - start_time > timeout_seconds:
+                return False
+            time.sleep(0.2)
+
+def release_token_lock():
+    """Release the token lock if held."""
+    global _token_lock_fd
+    try:
+        if _token_lock_fd is not None:
+            try:
+                fcntl.flock(_token_lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(_token_lock_fd)
+            except Exception:
+                pass
+    finally:
+        _token_lock_fd = None
 
 if __name__ == '__main__':
     # Menambahkan penanganan sinyal sistem (SIGTERM)
