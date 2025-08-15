@@ -99,7 +99,8 @@ def start_process(script_name):
     except Exception:
         pass
     log(f"Menjalankan {script_name} di latar belakang...")
-    command = f"PYTHONUNBUFFERED=1 nohup {sys.executable} {script_name} > {script_name}.log 2>&1 &"
+    # Pakai python -u (unbuffered) agar log realtime tanpa env assignment yang memicu error nohup
+    command = f"nohup {sys.executable} -u {script_name} > {script_name}.log 2>&1 &"
     subprocess.Popen(command, shell=True)
     if _wait_for_pid_file(expected_pid_file, timeout_sec=30):
         log(f"Berhasil menjalankan {script_name} (PID file: {expected_pid_file}).")
@@ -129,8 +130,8 @@ def tmux_session_exists(session: str) -> bool:
 
 def tmux_start(script_name: str):
     session = _tmux_session_name(script_name)
-    # Jalankan dengan tee agar tetap tercatat ke .log dan tampil di layar tmux
-    cmd = f"PYTHONUNBUFFERED=1 {sys.executable} {script_name} 2>&1 | tee -a {script_name}.log"
+    # Jalankan dengan python -u dan tee agar tetap tercatat ke .log dan tampil di layar tmux
+    cmd = f"{sys.executable} -u {script_name} 2>&1 | tee -a {script_name}.log"
     try:
         subprocess.check_call(["tmux", "new-session", "-d", "-s", session, cmd])
         log(f"Dijalankan di tmux session '{session}'.")
