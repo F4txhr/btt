@@ -2380,6 +2380,9 @@ async def main() -> None:
             return True
     # Deteksi: jika maintenance_bot masih berjalan, tangani otomatis sebelum start
     try:
+        # Debounce agar hanya sekali per startup
+        if not hasattr(application, 'auto_kill_maint_done'):
+            application.auto_kill_maint_done = False
         maint_pids = set()
         maint_pid_file = "maintenance_bot.pid"
         if os.path.exists(maint_pid_file):
@@ -2404,7 +2407,7 @@ async def main() -> None:
                         continue
         except Exception:
             pass
-        if maint_pids:
+        if maint_pids and not application.auto_kill_maint_done:
             # Beri tahu owner dan coba matikan otomatis
             try:
                 await application.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ Maintenance bot terdeteksi berjalan (PID: {sorted(list(maint_pids))}). Mencoba mematikan otomatis...")
@@ -2414,45 +2417,71 @@ async def main() -> None:
                 subprocess.run([sys.executable, "manager.py", "off"], check=False)
             except Exception:
                 pass
-            # Tunggu sebentar lalu cek ulang
-            await asyncio.sleep(3)
-            re_alive = False
-            try:
+            # Poll hingga 30 detik menunggu benar-benar mati
+            deadline = time.time() + 30
+            still_alive = False
+            while time.time() < deadline:
                 refreshed = set()
-                if os.path.exists(maint_pid_file):
-                    try:
+                try:
+                    if os.path.exists(maint_pid_file):
                         with open(maint_pid_file, "r") as f:
                             mpid2 = int((f.read() or "0").strip())
                         if mpid2 and _is_running(mpid2):
                             refreshed.add(mpid2)
+                except Exception:
+                    pass
+                try:
+                    out2 = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
+                    for line in out2.splitlines():
+                        if "maintenance_bot.py" in line and "grep" not in line:
+                            try:
+                                gpid = int(line.strip().split(None, 1)[0])
+                                if _is_running(gpid):
+                                    refreshed.add(gpid)
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                if not refreshed:
+                    still_alive = False
+                    break
+                still_alive = True
+                await asyncio.sleep(1)
+            # Jika masih hidup, kirim SIGKILL ke semua yang terdeteksi
+            if still_alive:
+                for pid in list(maint_pids):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
                     except Exception:
                         pass
-                out2 = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
-                for line in out2.splitlines():
-                    if "maintenance_bot.py" in line and "grep" not in line:
-                        try:
-                            gpid = int(line.strip().split(None, 1)[0])
-                            if _is_running(gpid):
-                                refreshed.add(gpid)
-                        except Exception:
-                            continue
-                if refreshed:
-                    re_alive = True
-                    maint_pids = refreshed
+                await asyncio.sleep(2)
+                # Cek terakhir
+                refreshed_final = set()
+                try:
+                    out3 = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
+                    for line in out3.splitlines():
+                        if "maintenance_bot.py" in line and "grep" not in line:
+                            try:
+                                gpid = int(line.strip().split(None, 1)[0])
+                                if _is_running(gpid):
+                                    refreshed_final.add(gpid)
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                if refreshed_final:
+                    try:
+                        await application.bot.send_message(chat_id=OWNER_ID, text=f"❌ Gagal mematikan maintenance otomatis. PID masih aktif: {sorted(list(refreshed_final))}. Jalankan 'python manager.py off' atau kill proses secara manual.")
+                    except Exception:
+                        pass
+                    return
+            # Sukses dimatikan
+            application.auto_kill_maint_done = True
+            try:
+                await application.bot.send_message(chat_id=OWNER_ID, text="✅ Maintenance dimatikan otomatis. Proses ini akan keluar; bot utama dijalankan oleh manager.")
             except Exception:
                 pass
-            if re_alive:
-                try:
-                    await application.bot.send_message(chat_id=OWNER_ID, text=f"❌ Gagal mematikan maintenance otomatis. PID masih aktif: {sorted(list(maint_pids))}. Jalankan 'python manager.py off' atau kill proses secara manual.")
-                except Exception:
-                    pass
-                return
-            else:
-                try:
-                    await application.bot.send_message(chat_id=OWNER_ID, text="✅ Maintenance dimatikan otomatis. Proses ini akan keluar; bot utama dijalankan oleh manager.")
-                except Exception:
-                    pass
-                return
+            return
     except Exception as e:
         logger.warning(f"Gagal melakukan deteksi proses maintenance: {e}")
     if os.path.exists(pid_file):
