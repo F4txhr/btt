@@ -8,6 +8,7 @@ MAINTENANCE_BOT_SCRIPT = "maintenance_bot.py"
 MAIN_BOT_PID_FILE = "main_bot.pid"
 MAINTENANCE_BOT_PID_FILE = "maintenance_bot.pid"
 LOG_FILE = "manager.log"
+OP_LOCK_FILE = "manager.op.lock"
 
 def log(message):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -77,10 +78,29 @@ def _wait_for_pid_file(pid_file: str, timeout_sec: int = 30) -> bool:
     return False
 
 def start_process(script_name):
-    log(f"Menjalankan {script_name} di latar belakang...")
-    command = f"nohup {sys.executable} {script_name} > {script_name}.log 2>&1 &"
-    subprocess.Popen(command, shell=True)
+    # Skip start jika sudah berjalan
     expected_pid_file = MAIN_BOT_PID_FILE if script_name == MAIN_BOT_SCRIPT else MAINTENANCE_BOT_PID_FILE
+    exist_pid = get_pid_from_file(expected_pid_file)
+    if exist_pid and _is_process_running(exist_pid):
+        log(f"{script_name} sudah berjalan dengan PID {exist_pid}. Lewati start.")
+        return
+    # Fallback cek ps
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
+        for line in out.splitlines():
+            if script_name in line and "grep" not in line:
+                try:
+                    pid = int(line.strip().split(None, 1)[0])
+                    if _is_process_running(pid):
+                        log(f"{script_name} terdeteksi via ps (PID {pid}). Lewati start.")
+                        return
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    log(f"Menjalankan {script_name} di latar belakang...")
+    command = f"nohup PYTHONUNBUFFERED=1 {sys.executable} {script_name} > {script_name}.log 2>&1 &"
+    subprocess.Popen(command, shell=True)
     if _wait_for_pid_file(expected_pid_file, timeout_sec=30):
         log(f"Berhasil menjalankan {script_name} (PID file: {expected_pid_file}).")
     else:
@@ -241,38 +261,58 @@ if __name__ == "__main__":
     if mode == 'monitor':
         monitor_logs(); sys.exit(0)
 
-    if mode == 'on':
-        log("--- MENGAKTIFKAN MODE MAINTENANCE ---")
-        kill_process(MAIN_BOT_PID_FILE)
-        if use_tmux_flag and _tmux_available():
-            tmux_start(MAINTENANCE_BOT_SCRIPT)
-        else:
-            start_process(MAINTENANCE_BOT_SCRIPT)
-        log("--- Mode maintenance SELESAI DIAKTIFKAN ---")
-        if auto_follow:
+    # Operation lock agar tidak ada dua manager on/off berjalan bersamaan
+    op_fd = None
+    try:
+        op_fd = os.open(OP_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+        import fcntl
+        fcntl.flock(op_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        log("Operasi manager lain sedang berjalan. Coba lagi nanti.")
+        sys.exit(1)
+
+    try:
+        if mode == 'on':
+            log("--- MENGAKTIFKAN MODE MAINTENANCE ---")
+            kill_process(MAIN_BOT_PID_FILE)
             if use_tmux_flag and _tmux_available():
-                tmux_attach(MAINTENANCE_BOT_SCRIPT)
+                tmux_start(MAINTENANCE_BOT_SCRIPT)
             else:
-                follow_log_for(MAINTENANCE_BOT_SCRIPT)
-    elif mode == 'off':
-        log("--- MENONAKTIFKAN MODE MAINTENANCE ---")
-        # Pastikan maintenance bot benar-benar mati
-        if not kill_process(MAINTENANCE_BOT_PID_FILE):
-            log("ERROR: Gagal mematikan proses maintenance sepenuhnya. Membatalkan start bot utama.")
-            sys.exit(1)
-        # Tambahan guard: pastikan tidak ada proses maintenance tersisa
-        time.sleep(1)
-        pid = get_pid_from_file(MAINTENANCE_BOT_PID_FILE)
-        if pid and _is_process_running(pid):
-            log("ERROR: Maintenance bot masih berjalan. Tidak memulai bot utama.")
-            sys.exit(1)
-        if use_tmux_flag and _tmux_available():
-            tmux_start(MAIN_BOT_SCRIPT)
-        else:
-            start_process(MAIN_BOT_SCRIPT)
-        log("--- Mode maintenance SELESAI DINONAKTIFKAN ---")
-        if auto_follow:
+                start_process(MAINTENANCE_BOT_SCRIPT)
+            log("--- Mode maintenance SELESAI DIAKTIFKAN ---")
+            if auto_follow:
+                if use_tmux_flag and _tmux_available():
+                    tmux_attach(MAINTENANCE_BOT_SCRIPT)
+                else:
+                    follow_log_for(MAINTENANCE_BOT_SCRIPT)
+        elif mode == 'off':
+            log("--- MENONAKTIFKAN MODE MAINTENANCE ---")
+            # Pastikan maintenance bot benar-benar mati
+            if not kill_process(MAINTENANCE_BOT_PID_FILE):
+                log("ERROR: Gagal mematikan proses maintenance sepenuhnya. Membatalkan start bot utama.")
+                sys.exit(1)
+            # Tambahan guard: pastikan tidak ada proses maintenance tersisa
+            time.sleep(1)
+            pid = get_pid_from_file(MAINTENANCE_BOT_PID_FILE)
+            if pid and _is_process_running(pid):
+                log("ERROR: Maintenance bot masih berjalan. Tidak memulai bot utama.")
+                sys.exit(1)
             if use_tmux_flag and _tmux_available():
-                tmux_attach(MAIN_BOT_SCRIPT)
+                tmux_start(MAIN_BOT_SCRIPT)
             else:
-                follow_log_for(MAIN_BOT_SCRIPT)
+                start_process(MAIN_BOT_SCRIPT)
+            log("--- Mode maintenance SELESAI DINONAKTIFKAN ---")
+            if auto_follow:
+                if use_tmux_flag and _tmux_available():
+                    tmux_attach(MAIN_BOT_SCRIPT)
+                else:
+                    follow_log_for(MAIN_BOT_SCRIPT)
+    finally:
+        # Lepaskan lock
+        try:
+            if op_fd is not None:
+                import fcntl
+                fcntl.flock(op_fd, fcntl.LOCK_UN)
+                os.close(op_fd)
+        except Exception:
+            pass
