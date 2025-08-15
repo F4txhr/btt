@@ -106,14 +106,87 @@ def follow_running_logs():
     else:
         log("Tidak ada proses yang berjalan untuk diikuti log-nya.")
 
+def _detect_active_process():
+    """Mengembalikan (script_name, pid) dari proses yang aktif, atau (None, None) jika tidak ada."""
+    main_pid = get_pid_from_file(MAIN_BOT_PID_FILE)
+    if main_pid and _is_process_running(main_pid):
+        return (MAIN_BOT_SCRIPT, main_pid)
+    maint_pid = get_pid_from_file(MAINTENANCE_BOT_PID_FILE)
+    if maint_pid and _is_process_running(maint_pid):
+        return (MAINTENANCE_BOT_SCRIPT, maint_pid)
+    # Fallback cek ps
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
+        for line in out.splitlines():
+            if MAINTENANCE_BOT_SCRIPT in line and "grep" not in line:
+                try:
+                    pid = int(line.strip().split(None, 1)[0]);
+                    if _is_process_running(pid): return (MAINTENANCE_BOT_SCRIPT, pid)
+                except Exception: pass
+        for line in out.splitlines():
+            if MAIN_BOT_SCRIPT in line and "grep" not in line:
+                try:
+                    pid = int(line.strip().split(None, 1)[0]);
+                    if _is_process_running(pid): return (MAIN_BOT_SCRIPT, pid)
+                except Exception: pass
+    except Exception:
+        pass
+    return (None, None)
+
+def monitor_logs():
+    """Mode monitor: otomatis mengikuti log proses aktif, berpindah saat proses berganti."""
+    log("Memulai mode monitor log (Ctrl+C untuk keluar)...")
+    current_script = None
+    tail_proc = None
+    try:
+        while True:
+            script, pid = _detect_active_process()
+            if script != current_script:
+                # hentikan tail lama jika ada
+                if tail_proc and tail_proc.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(tail_proc.pid), signal.SIGTERM)
+                    except Exception:
+                        try: tail_proc.terminate()
+                        except Exception: pass
+                    try: tail_proc.wait(timeout=2)
+                    except Exception: pass
+                tail_proc = None
+                current_script = script
+                if script:
+                    log(f"Berpindah mengikuti log: {script}.log (PID: {pid})")
+                    try:
+                        tail_proc = subprocess.Popen(
+                            ["tail", "-F", f"{script}.log"],
+                            preexec_fn=os.setsid
+                        )
+                    except Exception as e:
+                        log(f"ERROR: Gagal memulai tail untuk {script}.log: {e}")
+                else:
+                    log("Tidak ada proses aktif saat ini. Menunggu...")
+            time.sleep(2)
+    except KeyboardInterrupt:
+        log("Monitor dihentikan oleh pengguna.")
+    finally:
+        if tail_proc and tail_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(tail_proc.pid), signal.SIGTERM)
+            except Exception:
+                try: tail_proc.terminate()
+                except Exception: pass
+            try: tail_proc.wait(timeout=2)
+            except Exception: pass
+
 if __name__ == "__main__":
-    # Dukungan argumen: on [--follow], off [--follow], logs
-    if len(sys.argv) < 2 or sys.argv[1] not in ['on', 'off', 'logs']:
-        log("ERROR: Argumen tidak valid. Gunakan 'on [--follow]', 'off [--follow]' atau 'logs'."); sys.exit(1)
+    # Dukungan argumen: on [--follow], off [--follow], logs, monitor
+    if len(sys.argv) < 2 or sys.argv[1] not in ['on', 'off', 'logs', 'monitor']:
+        log("ERROR: Argumen tidak valid. Gunakan 'on [--follow]', 'off [--follow]', 'logs', atau 'monitor'."); sys.exit(1)
     mode = sys.argv[1]
     follow = ('--follow' in sys.argv[2:])
     if mode == 'logs':
         follow_running_logs(); sys.exit(0)
+    if mode == 'monitor':
+        monitor_logs(); sys.exit(0)
     if mode == 'on':
         log("--- MENGAKTIFKAN MODE MAINTENANCE ---")
         kill_process(MAIN_BOT_PID_FILE)
