@@ -2393,20 +2393,6 @@ async def main() -> None:
                     maint_pids.add(mpid)
             except Exception:
                 pass
-        # Fallback grep via ps untuk memastikan tidak ada proses orphan
-        try:
-            out = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
-            for line in out.splitlines():
-                if "maintenance_bot.py" in line and "grep" not in line:
-                    try:
-                        pid_str = line.strip().split(None, 1)[0]
-                        gpid = int(pid_str)
-                        if _is_running(gpid):
-                            maint_pids.add(gpid)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
         if maint_pids and not application.auto_kill_maint_done:
             # Beri tahu owner dan coba matikan otomatis
             try:
@@ -2430,18 +2416,6 @@ async def main() -> None:
                             refreshed.add(mpid2)
                 except Exception:
                     pass
-                try:
-                    out2 = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
-                    for line in out2.splitlines():
-                        if "maintenance_bot.py" in line and "grep" not in line:
-                            try:
-                                gpid = int(line.strip().split(None, 1)[0])
-                                if _is_running(gpid):
-                                    refreshed.add(gpid)
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
                 if not refreshed:
                     still_alive = False
                     break
@@ -2458,15 +2432,11 @@ async def main() -> None:
                 # Cek terakhir
                 refreshed_final = set()
                 try:
-                    out3 = subprocess.check_output(["ps", "-eo", "pid,cmd"], text=True)
-                    for line in out3.splitlines():
-                        if "maintenance_bot.py" in line and "grep" not in line:
-                            try:
-                                gpid = int(line.strip().split(None, 1)[0])
-                                if _is_running(gpid):
-                                    refreshed_final.add(gpid)
-                            except Exception:
-                                continue
+                    if os.path.exists(maint_pid_file):
+                        with open(maint_pid_file, "r") as f:
+                            mpid3 = int((f.read() or "0").strip())
+                        if mpid3 and _is_running(mpid3):
+                            refreshed_final.add(mpid3)
                 except Exception:
                     pass
                 if refreshed_final:
