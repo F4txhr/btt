@@ -86,6 +86,48 @@ def start_process(script_name):
     else:
         log(f"PERINGATAN: {script_name} belum menulis PID dalam batas waktu. Periksa log jika terjadi masalah.")
 
+# --- TMUX SUPPORT ---
+
+def _tmux_available() -> bool:
+    try:
+        subprocess.check_output(["tmux", "-V"], stderr=subprocess.STDOUT)
+        return True
+    except Exception:
+        return False
+
+def _tmux_session_name(script_name: str) -> str:
+    return "btt-main" if script_name == MAIN_BOT_SCRIPT else "btt-maint"
+
+def tmux_session_exists(session: str) -> bool:
+    try:
+        subprocess.check_call(["tmux", "has-session", "-t", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+    except Exception:
+        return False
+
+def tmux_start(script_name: str):
+    session = _tmux_session_name(script_name)
+    # Jalankan dengan tee agar tetap tercatat ke .log dan tampil di layar tmux
+    cmd = f"PYTHONUNBUFFERED=1 {sys.executable} {script_name} 2>&1 | tee -a {script_name}.log"
+    try:
+        subprocess.check_call(["tmux", "new-session", "-d", "-s", session, cmd])
+        log(f"Dijalankan di tmux session '{session}'.")
+    except Exception as e:
+        log(f"ERROR: Gagal menjalankan tmux session '{session}': {e}")
+
+def tmux_attach(script_name: str):
+    session = _tmux_session_name(script_name)
+    if tmux_session_exists(session):
+        log(f"Menempel ke tmux session: {session} (Ctrl+b d untuk detach)")
+        try:
+            subprocess.call(["tmux", "attach", "-t", session])
+        except KeyboardInterrupt:
+            pass
+    else:
+        follow_log_for(script_name)
+
 def follow_log_for(script_name):
     """Menampilkan log real-time untuk proses tertentu (Ctrl+C untuk keluar)."""
     log_file = f"{script_name}.log"
@@ -100,9 +142,16 @@ def follow_running_logs():
     main_pid = get_pid_from_file(MAIN_BOT_PID_FILE)
     maint_pid = get_pid_from_file(MAINTENANCE_BOT_PID_FILE)
     if main_pid and _is_process_running(main_pid):
-        follow_log_for(MAIN_BOT_SCRIPT)
+        # Jika tmux ada dan session ada, attach; jika tidak, tail
+        if _tmux_available() and tmux_session_exists(_tmux_session_name(MAIN_BOT_SCRIPT)):
+            tmux_attach(MAIN_BOT_SCRIPT)
+        else:
+            follow_log_for(MAIN_BOT_SCRIPT)
     elif maint_pid and _is_process_running(maint_pid):
-        follow_log_for(MAINTENANCE_BOT_SCRIPT)
+        if _tmux_available() and tmux_session_exists(_tmux_session_name(MAINTENANCE_BOT_SCRIPT)):
+            tmux_attach(MAINTENANCE_BOT_SCRIPT)
+        else:
+            follow_log_for(MAINTENANCE_BOT_SCRIPT)
     else:
         log("Tidak ada proses yang berjalan untuk diikuti log-nya.")
 
@@ -178,22 +227,33 @@ def monitor_logs():
             except Exception: pass
 
 if __name__ == "__main__":
-    # Dukungan argumen: on [--follow], off [--follow], logs, monitor
+    # Dukungan argumen: on [--follow] [--tmux], off [--follow] [--tmux], logs, monitor
     if len(sys.argv) < 2 or sys.argv[1] not in ['on', 'off', 'logs', 'monitor']:
-        log("ERROR: Argumen tidak valid. Gunakan 'on [--follow]', 'off [--follow]', 'logs', atau 'monitor'."); sys.exit(1)
+        log("ERROR: Argumen tidak valid. Gunakan 'on [--follow] [--tmux]', 'off [--follow] [--tmux]', 'logs', atau 'monitor'."); sys.exit(1)
     mode = sys.argv[1]
-    follow = ('--follow' in sys.argv[2:])
+    follow_flag = ('--follow' in sys.argv[2:])
+    use_tmux_flag = ('--tmux' in sys.argv[2:]) or (os.getenv('MANAGER_TMUX', '0').lower() in ('1','true','yes'))
+    is_interactive = sys.stdout.isatty()
+    auto_follow = follow_flag or is_interactive
+
     if mode == 'logs':
         follow_running_logs(); sys.exit(0)
     if mode == 'monitor':
         monitor_logs(); sys.exit(0)
+
     if mode == 'on':
         log("--- MENGAKTIFKAN MODE MAINTENANCE ---")
         kill_process(MAIN_BOT_PID_FILE)
-        start_process(MAINTENANCE_BOT_SCRIPT)
+        if use_tmux_flag and _tmux_available():
+            tmux_start(MAINTENANCE_BOT_SCRIPT)
+        else:
+            start_process(MAINTENANCE_BOT_SCRIPT)
         log("--- Mode maintenance SELESAI DIAKTIFKAN ---")
-        if follow:
-            follow_log_for(MAINTENANCE_BOT_SCRIPT)
+        if auto_follow:
+            if use_tmux_flag and _tmux_available():
+                tmux_attach(MAINTENANCE_BOT_SCRIPT)
+            else:
+                follow_log_for(MAINTENANCE_BOT_SCRIPT)
     elif mode == 'off':
         log("--- MENONAKTIFKAN MODE MAINTENANCE ---")
         # Pastikan maintenance bot benar-benar mati
@@ -206,7 +266,13 @@ if __name__ == "__main__":
         if pid and _is_process_running(pid):
             log("ERROR: Maintenance bot masih berjalan. Tidak memulai bot utama.")
             sys.exit(1)
-        start_process(MAIN_BOT_SCRIPT)
+        if use_tmux_flag and _tmux_available():
+            tmux_start(MAIN_BOT_SCRIPT)
+        else:
+            start_process(MAIN_BOT_SCRIPT)
         log("--- Mode maintenance SELESAI DINONAKTIFKAN ---")
-        if follow:
-            follow_log_for(MAIN_BOT_SCRIPT)
+        if auto_follow:
+            if use_tmux_flag and _tmux_available():
+                tmux_attach(MAIN_BOT_SCRIPT)
+            else:
+                follow_log_for(MAIN_BOT_SCRIPT)
