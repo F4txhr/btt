@@ -99,7 +99,7 @@ def start_process(script_name):
     except Exception:
         pass
     log(f"Menjalankan {script_name} di latar belakang...")
-    command = f"nohup PYTHONUNBUFFERED=1 {sys.executable} {script_name} > {script_name}.log 2>&1 &"
+    command = f"PYTHONUNBUFFERED=1 nohup {sys.executable} {script_name} > {script_name}.log 2>&1 &"
     subprocess.Popen(command, shell=True)
     if _wait_for_pid_file(expected_pid_file, timeout_sec=30):
         log(f"Berhasil menjalankan {script_name} (PID file: {expected_pid_file}).")
