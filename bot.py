@@ -13,12 +13,12 @@ import os
 import signal
 import sys
 import pickle
-import fcntl
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from math import radians, cos, sin, asin, sqrt
 
+from utils import acquire_token_lock, release_token_lock, PIDManager
 
 from telegram import (
     Update,
@@ -38,7 +38,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
-    PicklePersistence,
+    JSONPersistence,
     JobQueue,
     ApplicationHandlerStop,
 )
@@ -50,6 +50,9 @@ from collections import deque
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "5361605327"))
 DEVELOPER_CHAT_ID = int(os.getenv("DEVELOPER_CHAT_ID", str(OWNER_ID)))
+
+# Matchmaking config
+MATCH_SCORE_THRESHOLD = int(os.getenv("MATCH_SCORE_THRESHOLD", "40"))
 
 # Global rate limiter config
 GLOBAL_RPS = int(os.getenv("GLOBAL_RPS", "25"))
@@ -66,11 +69,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+from handlers.profile import profil_conv, P_AGE, P_BIO, P_PHOTO, P_INTERESTS, P_LOCATION, P_MANUAL_INTEREST, P_GENDER, PROFILE_MAIN
+
 # Conversation states
-( PROFILE_MAIN, P_AGE, P_BIO, P_PHOTO, P_INTERESTS, P_LOCATION, P_MANUAL_INTEREST, P_GENDER,
+(
     SET_FILTER_AGE, SET_FILTER_INTERESTS, SET_FILTER_DISTANCE, SET_FILTER_GENDER,
     QUIZ_QUESTION, QUIZ_ANSWER, CONFIRM_MAINTENANCE
-) = range(15)
+) = range(P_GENDER + 1, P_GENDER + 8)
 
 # Shop items
 SHOP_ITEMS = {
@@ -595,230 +600,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN_V2)
 
 # =============================
-#  PROFILE HANDLERS
-# =============================
-@auto_update_profile
-async def profil_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if remove_from_queue(context, update.effective_user.id):
-        await update.message.reply_text("Pencarian dibatalkan saat masuk ke menu profil.")
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def display_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    db = get_db(context)
-    profile = await get_user_profile_data(db, user_id)
-    def format_interests(s): return ', '.join([i.capitalize() for i in s.split(',')]) if s else 'Belum diatur'
-    
-    menu_text = (
-        "👤 *Menu Profil Anda*\n\n"
-        "Klik tombol di bawah untuk mengatur informasi profil Anda\\.\n\n"
-        f"• *Gender:* `{escape_md(profile.get('gender') or 'Belum diatur')}`\n"
-        f"• *Usia:* `{escape_md(str(profile.get('age') or 'Belum diatur'))}`\n"
-        f"• *Bio:* `{escape_md(profile.get('bio') or 'Belum diatur')}`\n"
-        f"• *Minat:* `{escape_md(format_interests(profile.get('interests')))}`\n"
-        f"• *Lokasi:* `{'Sudah diatur' if profile.get('latitude') else 'Belum diatur'}`\n"
-        f"• *Foto Profil:* `{'Sudah diatur' if profile.get('profile_pic_id') else 'Belum diatur'}`"
-    )
-    keyboard = [
-        [InlineKeyboardButton("🚻 Gender", callback_data="p_edit_gender"), InlineKeyboardButton("🎂 Usia", callback_data="p_edit_age")],
-        [InlineKeyboardButton("📝 Bio", callback_data="p_edit_bio"), InlineKeyboardButton("🖼️ Foto", callback_data="p_edit_photo")],
-        [InlineKeyboardButton("🎨 Minat", callback_data="p_edit_interests"), InlineKeyboardButton("📍 Lokasi", callback_data="p_edit_location")],
-        [InlineKeyboardButton("✅ Selesai & Tutup", callback_data="p_close")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    chat_id = update.effective_chat.id
-    
-    message_id_to_delete = context.user_data.pop('profile_message_id', None)
-    if message_id_to_delete:
-        try: await context.bot.delete_message(chat_id=chat_id, message_id=message_id_to_delete)
-        except Exception: pass
-    
-    sent_message = await context.bot.send_message(chat_id, menu_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-    context.user_data['profile_message_id'] = sent_message.message_id
-    
-async def back_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Helper untuk menggambar ulang menu utama dan kembali ke state PROFILE_MAIN."""
-    query = update.callback_query
-    if query:
-        await query.answer()
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def p_prompt_for_input(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, new_state: int):
-    query = update.callback_query; await query.answer()
-    prompts = {
-        'age': "Silakan kirimkan usia Anda \\(angka saja, misal: 25\\)\\.",
-        'bio': "Silakan kirimkan bio singkat Anda\\.",
-        'photo': "Silakan kirimkan satu foto untuk profil anonim Anda\\."
-    }
-    await query.edit_message_text(prompts[field], parse_mode=ParseMode.MARKDOWN_V2)
-    return new_state
-
-async def p_receive_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.text.isdigit() or not 13 <= int(update.message.text) <= 100:
-        await update.message.reply_text("Input tidak valid. Harap kirim angka antara 13 dan 100.")
-        return P_AGE
-    db = get_db(context)
-    await db.execute("UPDATE user_profiles SET age = ? WHERE user_id = ?", (int(update.message.text), update.effective_user.id))
-    await db.commit()
-    await update.message.delete()
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def p_receive_bio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = get_db(context)
-    await db.execute("UPDATE user_profiles SET bio = ? WHERE user_id = ?", (update.message.text, update.effective_user.id))
-    await db.commit()
-    await update.message.delete()
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def p_receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = get_db(context)
-    await db.execute("UPDATE user_profiles SET profile_pic_id = ? WHERE user_id = ?", (update.message.photo[-1].file_id, update.effective_user.id))
-    await db.commit()
-    await update.message.delete()
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def p_edit_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query; await query.answer()
-    keyboard = [
-        [InlineKeyboardButton("Laki-laki", callback_data="p_set_gender_Laki-laki"), InlineKeyboardButton("Perempuan", callback_data="p_set_gender_Perempuan")],
-        [InlineKeyboardButton("<< Kembali", callback_data="p_back_main")]
-    ]
-    await query.edit_message_text("Pilih jenis kelamin Anda:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return P_GENDER
-
-async def p_set_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    gender = query.data.split('_')[-1]
-    db = get_db(context)
-    await db.execute("UPDATE user_profiles SET gender = ? WHERE user_id = ?", (gender, query.from_user.id))
-    await db.commit()
-    await query.answer(f"Gender diatur ke {gender}")
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def p_edit_interests_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, is_new=False):
-    query = update.callback_query; await query.answer()
-    user_id = query.from_user.id
-    if is_new or 'temp_interests' not in context.user_data:
-        db = get_db(context)
-        profile = await get_user_profile_data(db, user_id)
-        context.user_data['temp_interests'] = [i for i in (profile.get('interests') or "").split(',') if i]
-    selected_interests = set(context.user_data.get('temp_interests', []))
-    keyboard = []; row = []
-    for interest in COMMON_INTERESTS:
-        text = f"{'✅ ' if interest.lower() in selected_interests else ''}{interest}"
-        row.append(InlineKeyboardButton(text, callback_data=f"p_toggle_{interest.lower()}"))
-        if len(row) == 3: keyboard.append(row); row = []
-    if row: keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("✏️ Tambah Manual", callback_data="p_manual_interest_prompt")])
-    keyboard.append([InlineKeyboardButton("💾 Simpan", callback_data="p_save_interests"), InlineKeyboardButton("<< Kembali", callback_data="p_back_main_from_interest")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    display_interests = ", ".join(sorted([i.capitalize() for i in selected_interests])) or "Belum ada"
-    text = (f"🎨 *Pilih Minat Anda*\n\nKlik untuk memilih minat\\. Pilihan ini akan ditampilkan di profil Anda\\.\n\n*Pilihan saat ini:* `{escape_md(display_interests)}`")
-    try: await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-    except telegram.error.BadRequest as e:
-        if "Message is not modified" not in str(e): logger.error(f"Error editing interest menu: {e}")
-    return P_INTERESTS
-
-async def p_toggle_interest_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    interest = query.data.split('_', 2)[2]
-    selected_interests = context.user_data.get('temp_interests', [])
-    if interest in selected_interests: selected_interests.remove(interest)
-    else: selected_interests.append(interest)
-    context.user_data['temp_interests'] = selected_interests
-    return await p_edit_interests_menu(update, context)
-
-async def p_prompt_manual_interest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    await query.edit_message_text("Kirim satu minat yang ingin Anda tambahkan \\(maks 20 karakter\\)\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    return P_MANUAL_INTEREST
-
-async def p_receive_manual_interest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    manual_interest = update.message.text.strip().lower()
-    if ',' in manual_interest or len(manual_interest) > 20:
-        await update.message.reply_text("Harap masukkan hanya satu minat (maks 20 karakter), tanpa koma.")
-        return P_MANUAL_INTEREST
-    selected_interests = set(context.user_data.get('temp_interests', [])); selected_interests.add(manual_interest)
-    context.user_data['temp_interests'] = list(selected_interests)
-    await update.message.delete()
-    
-    keyboard = []; row = []
-    for interest in COMMON_INTERESTS:
-        text = f"{'✅ ' if interest.lower() in selected_interests else ''}{interest}"
-        row.append(InlineKeyboardButton(text, callback_data=f"p_toggle_{interest.lower()}"))
-        if len(row) == 3: keyboard.append(row); row = []
-    if row: keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("✏️ Tambah Manual", callback_data="p_manual_interest_prompt")])
-    keyboard.append([InlineKeyboardButton("💾 Simpan", callback_data="p_save_interests"), InlineKeyboardButton("<< Kembali", callback_data="p_back_main_from_interest")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    display_interests = ", ".join(sorted([i.capitalize() for i in selected_interests])) or "Belum ada"
-    text = (f"🎨 *Pilih Minat Anda*\n\nKlik untuk memilih minat\\. Pilihan ini akan ditampilkan di profil Anda\\.\n\n*Pilihan saat ini:* `{escape_md(display_interests)}`")
-    profile_message_id = context.user_data.get('profile_message_id')
-    if profile_message_id:
-        try: await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=profile_message_id, text=text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-        except Exception: await display_profile_menu(update, context)
-    return P_INTERESTS
-
-async def p_save_interests_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer("Minat berhasil disimpan!")
-    db = get_db(context)
-    final_interests = ",".join(sorted(list(set(context.user_data.pop('temp_interests', [])))))
-    await db.execute("UPDATE user_profiles SET interests = ? WHERE user_id = ?", (final_interests, query.from_user.id))
-    await db.commit()
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def p_prompt_for_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    await query.message.delete()
-    context.user_data.pop('profile_message_id', None)
-    kb = ReplyKeyboardMarkup([[KeyboardButton("📍 Bagikan Lokasi Saya", request_location=True)]], resize_keyboard=True, one_time_keyboard=True)
-    prompt_msg = await update.effective_chat.send_message("Tekan tombol di bawah untuk membagikan lokasi Anda.", reply_markup=kb)
-    context.user_data['prompt_message_id'] = prompt_msg.message_id
-    return P_LOCATION
-
-async def p_receive_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = get_db(context)
-    await db.execute("UPDATE user_profiles SET latitude = ?, longitude = ? WHERE user_id = ?", (update.message.location.latitude, update.message.location.longitude, update.effective_user.id))
-    await db.commit()
-    prompt_msg_id = context.user_data.pop('prompt_message_id', None)
-    if prompt_msg_id:
-        try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prompt_msg_id)
-        except Exception: pass
-    await update.message.delete()
-    await update.effective_chat.send_message("Lokasi berhasil disimpan!", reply_markup=ReplyKeyboardRemove())
-    await display_profile_menu(update, context)
-    return PROFILE_MAIN
-
-async def p_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    await query.message.delete()
-    context.user_data.pop('profile_message_id', None)
-    await safe_send_message(context.bot, query.from_user.id, "Menu profil ditutup.")
-    return ConversationHandler.END
-    
-    
-# =============================
 # CHAT & SEARCH HANDLERS
 # =============================
 
 # --- FUNGSI-FUNGSI BANTUAN (DEFINISIKAN DULU) ---
-
-def _haversine_distance(lat1, lon1, lat2, lon2):
-    """Menghitung jarak antara dua titik koordinat dalam kilometer."""
-    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
-    c = 2 * asin(sqrt(a))
-    r = 6371
-    return c * r
 
 async def ice_breaker_callback(context: ContextTypes.DEFAULT_TYPE):
     """Ice breaker job callback"""
@@ -1010,7 +795,7 @@ async def try_match_users(context: ContextTypes.DEFAULT_TYPE):
 
         # Setelah memeriksa semua pasangan, jika ditemukan pasangan terbaik
         # dengan skor di atas ambang batas (misal, 40), pasangkan mereka.
-        if best_pair and highest_score >= 40:
+        if best_pair and highest_score >= MATCH_SCORE_THRESHOLD:
             user_a, user_b = best_pair
             logger.info(f"Pasangan terbaik ditemukan: {user_a['user_id']} & {user_b['user_id']} dengan skor {highest_score:.2f}")
             
@@ -2132,7 +1917,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             text=fallback_message,
             parse_mode=ParseMode.HTML
         )
-        
+
+
 # STARTUP JOB & SHUTDOWN
 
 async def run_startup_tasks(application: Application):
@@ -2222,7 +2008,7 @@ async def main() -> None:
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .persistence(PicklePersistence(filepath="bot_persistence.pkl"))
+        .persistence(JSONPersistence(filepath="bot_persistence.json"))
         .build()
     )
     
@@ -2240,38 +2026,6 @@ async def main() -> None:
         return
     
     # --- Conversation Handlers ---
-
-    profil_conv = ConversationHandler(
-        entry_points=[CommandHandler('profil', profil_command)],
-        states={
-            PROFILE_MAIN: [
-                CallbackQueryHandler(p_edit_gender, pattern="^p_edit_gender$"),
-                CallbackQueryHandler(lambda u, c: p_prompt_for_input(u, c, 'age', P_AGE), pattern="^p_edit_age$"),
-                CallbackQueryHandler(lambda u, c: p_prompt_for_input(u, c, 'bio', P_BIO), pattern="^p_edit_bio$"),
-                CallbackQueryHandler(lambda u, c: p_prompt_for_input(u, c, 'photo', P_PHOTO), pattern="^p_edit_photo$"),
-                CallbackQueryHandler(lambda u, c: p_edit_interests_menu(u, c, is_new=True), pattern="^p_edit_interests$"),
-                CallbackQueryHandler(p_prompt_for_location, pattern="^p_edit_location$"),
-                CallbackQueryHandler(p_close, pattern="^p_close$"),
-            ],
-            P_GENDER: [
-                CallbackQueryHandler(p_set_gender, pattern="^p_set_gender_"),
-                CallbackQueryHandler(back_to_main_menu, pattern="^p_back_main$"),
-            ],
-            P_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, p_receive_age)],
-            P_BIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, p_receive_bio)],
-            P_PHOTO: [MessageHandler(filters.PHOTO, p_receive_photo)],
-            P_LOCATION: [MessageHandler(filters.LOCATION, p_receive_location)],
-            P_INTERESTS: [
-                CallbackQueryHandler(p_toggle_interest_callback, pattern="^p_toggle_"),
-                CallbackQueryHandler(p_prompt_manual_interest, pattern="^p_manual_interest_prompt$"),
-                CallbackQueryHandler(p_save_interests_callback, pattern="^p_save_interests$"),
-                CallbackQueryHandler(back_to_main_menu, pattern="^p_back_main_from_interest$"),
-            ],
-            P_MANUAL_INTEREST: [MessageHandler(filters.TEXT & ~filters.COMMAND, p_receive_manual_interest)],
-        },
-        fallbacks=[CommandHandler('cancel', p_close)],
-        per_user=True, per_chat=True, per_message=False, allow_reentry=True
-    )
 
     # GANTI TOTAL BLOK set_filter_conv DI FUNGSI main() DENGAN INI
 
@@ -2368,166 +2122,65 @@ async def main() -> None:
     application.add_error_handler(error_handler)
 
     # --- Run the bot ---
-    pid_file = "main_bot.pid"
-    # Guard single instance via pid file
-    def _is_running(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-    # Deteksi: jika maintenance_bot masih berjalan, tangani otomatis sebelum start
-    try:
-        # Debounce agar hanya sekali per startup
-        if not hasattr(application, 'auto_kill_maint_done'):
-            application.auto_kill_maint_done = False
-        maint_pids = set()
-        maint_pid_file = "maintenance_bot.pid"
-        if os.path.exists(maint_pid_file):
-            try:
-                with open(maint_pid_file, "r") as f:
-                    mpid = int((f.read() or "0").strip())
-                if mpid and _is_running(mpid):
-                    maint_pids.add(mpid)
-            except Exception:
-                pass
-        if maint_pids and not application.auto_kill_maint_done:
-            # Beri tahu owner dan coba matikan otomatis
-            try:
-                await application.bot.send_message(chat_id=OWNER_ID, text=f"⚠️ Maintenance bot terdeteksi berjalan (PID: {sorted(list(maint_pids))}). Mencoba mematikan otomatis...")
-            except Exception:
-                pass
-            try:
-                subprocess.run([sys.executable, "manager.py", "off"], check=False)
-            except Exception:
-                pass
-            # Poll hingga 30 detik menunggu benar-benar mati
-            deadline = time.time() + 30
-            still_alive = False
-            while time.time() < deadline:
-                refreshed = set()
-                try:
-                    if os.path.exists(maint_pid_file):
-                        with open(maint_pid_file, "r") as f:
-                            mpid2 = int((f.read() or "0").strip())
-                        if mpid2 and _is_running(mpid2):
-                            refreshed.add(mpid2)
-                except Exception:
-                    pass
-                if not refreshed:
-                    still_alive = False
-                    break
-                still_alive = True
-                await asyncio.sleep(1)
-            # Jika masih hidup, kirim SIGKILL ke semua yang terdeteksi
-            if still_alive:
-                for pid in list(maint_pids):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-                await asyncio.sleep(2)
-                # Cek terakhir
-                refreshed_final = set()
-                try:
-                    if os.path.exists(maint_pid_file):
-                        with open(maint_pid_file, "r") as f:
-                            mpid3 = int((f.read() or "0").strip())
-                        if mpid3 and _is_running(mpid3):
-                            refreshed_final.add(mpid3)
-                except Exception:
-                    pass
-                if refreshed_final:
-                    try:
-                        await application.bot.send_message(chat_id=OWNER_ID, text=f"❌ Gagal mematikan maintenance otomatis. PID masih aktif: {sorted(list(refreshed_final))}. Jalankan 'python manager.py off' atau kill proses secara manual.")
-                    except Exception:
-                        pass
-                    return
-            # Sukses dimatikan
-            application.auto_kill_maint_done = True
-            try:
-                await application.bot.send_message(chat_id=OWNER_ID, text="✅ Maintenance dimatikan otomatis. Proses ini akan keluar; bot utama dijalankan oleh manager.")
-            except Exception:
-                pass
+    pid_manager = PIDManager("main_bot.pid")
+    with pid_manager as pid_is_new:
+        if not pid_is_new:
+            logger.error(f"Bot utama sudah berjalan dengan PID lain. Keluar.")
             return
-    except Exception as e:
-        logger.warning(f"Gagal melakukan deteksi proses maintenance: {e}")
-    if os.path.exists(pid_file):
-        try:
-            with open(pid_file, "r") as f:
-                old = int(f.read().strip() or 0)
-            if old and _is_running(old):
-                logger.error(f"Bot utama sudah berjalan dengan PID {old}. Keluar.")
-                return
-        except Exception:
-            pass
-        try: os.remove(pid_file)
-        except Exception: pass
-    with open(pid_file, "w") as f:
-        f.write(str(os.getpid()))
-    try:
-        await application.initialize()
-        await reschedule_maintenance_jobs(application)
-        await application.start()
-        # Acquire token lock before starting polling to avoid 409 with other process
-        if not acquire_token_lock():
-            logger.error("Gagal mengakuisisi token lock dalam batas waktu. Keluar.")
-            return
-        await application.updater.start_polling(drop_pending_updates=True)
-        # Jadwalkan tugas startup (broadcast online dan event lain)
-        try:
-            await run_startup_tasks(application)
-        except Exception as e:
-            logger.warning(f"Gagal menjadwalkan tugas startup: {e}")
-        logger.info("Bot utama berjalan.")
-        await shutdown_event.wait()
-    finally:
-        logger.info("Memulai shutdown bot utama...")
-        if application.updater and application.updater.running: await application.updater.stop()
-        # Sanitasi user_data agar persistence tidak gagal karena objek tak bisa dipickle
-        try:
-            def _sanitize(val, depth=0):
-                if depth > 5:
-                    return None
-                if isinstance(val, (str, int, float, bool)) or val is None:
-                    return val
-                if isinstance(val, list):
-                    return [x for x in (_sanitize(v, depth+1) for v in val) if x is not None]
-                if isinstance(val, tuple):
-                    return tuple([x for x in (_sanitize(v, depth+1) for v in val) if x is not None])
-                if isinstance(val, dict):
-                    newd = {}
-                    for k, v in val.items():
-                        sv = _sanitize(v, depth+1)
-                        if sv is not None:
-                            newd[k] = sv
-                    return newd
-                # fallback: drop non-serializable
-                try:
-                    pickle.dumps(val)
-                    return val
-                except Exception:
-                    return None
-            for uid in list(application.user_data.keys()):
-                application.user_data[uid] = _sanitize(application.user_data[uid])
-        except Exception:
-            pass
-        if application.running: await application.stop()
-        await application.shutdown()
-        # Release token lock at the end
-        release_token_lock()
-        if hasattr(application, 'db_connection'): await application.db_connection.close()
-        if os.path.exists(pid_file): os.remove(pid_file)
-        logger.info("Bot utama telah dimatikan.")
-        
-        if hasattr(application, 'db_connection') and application.db_connection:
-            await application.db_connection.close()
-            logger.info("Database connection closed.")
-        
-        logger.info("Shutdown complete.")
 
+        try:
+            await application.initialize()
+            await reschedule_maintenance_jobs(application)
+            await application.start()
+
+            # Acquire token lock before starting polling
+            if not acquire_token_lock(TOKEN_LOCK_FILE, TOKEN_LOCK_WAIT_SECONDS):
+                logger.error("Gagal mengakuisisi token lock dalam batas waktu. Keluar.")
+                return
+
+            await application.updater.start_polling(drop_pending_updates=True)
+
+            # Jadwalkan tugas startup (broadcast online dan event lain)
+            try:
+                await run_startup_tasks(application)
+            except Exception as e:
+                logger.warning(f"Gagal menjadwalkan tugas startup: {e}")
+
+            logger.info("Bot utama berjalan.")
+            await shutdown_event.wait()
+
+        finally:
+            logger.info("Memulai shutdown bot utama...")
+            if application.updater and application.updater.running:
+                await application.updater.stop()
+
+            # Sanitize user_data before saving to JSON
+            try:
+                def _sanitize(val, depth=0):
+                    if depth > 5: return None
+                    if isinstance(val, (str, int, float, bool, type(None))): return val
+                    if isinstance(val, list): return [_sanitize(v, depth + 1) for v in val]
+                    if isinstance(val, tuple): return tuple(_sanitize(v, depth + 1) for v in val) # JSONPersistence converts tuples to lists
+                    if isinstance(val, dict): return {k: _sanitize(v, depth + 1) for k, v in val.items()}
+                    # For any other type that is not directly JSON serializable, return None
+                    return None
+                for uid in list(application.user_data.keys()):
+                    application.user_data[uid] = _sanitize(application.user_data[uid])
+            except Exception as e:
+                logger.error(f"Error sanitizing user_data: {e}")
+
+            if application.running:
+                await application.stop()
+
+            await application.shutdown()
+
+            release_token_lock()
+
+            if hasattr(application, 'db_connection') and application.db_connection:
+                await application.db_connection.close()
+                logger.info("Database connection closed.")
+
+            logger.info("Shutdown complete.")
 def remove_from_queue(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """Remove user from waiting queue"""
     waiting_queue = context.bot_data.setdefault('waiting_queue', [])
@@ -2540,55 +2193,11 @@ def remove_from_queue(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
         return True
     return False
 
-def acquire_token_lock(timeout_seconds: int = TOKEN_LOCK_WAIT_SECONDS) -> bool:
-    """Acquire exclusive token lock. Blocks until acquired or timeout. Returns True if acquired."""
-    global _token_lock_fd
-    start_time = time.time()
-    # Open or create lock file
-    _token_lock_fd = os.open(TOKEN_LOCK_FILE, os.O_CREAT | os.O_RDWR)
-    while True:
-        try:
-            fcntl.flock(_token_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Write owner pid for observability
-            try:
-                os.ftruncate(_token_lock_fd, 0)
-                os.write(_token_lock_fd, str(os.getpid()).encode())
-                os.lseek(_token_lock_fd, 0, os.SEEK_SET)
-            except Exception:
-                pass
-            return True
-        except BlockingIOError:
-            if time.time() - start_time > timeout_seconds:
-                return False
-            time.sleep(0.2)
-
-def release_token_lock():
-    """Release the token lock if held."""
-    global _token_lock_fd
-    try:
-        if _token_lock_fd is not None:
-            try:
-                fcntl.flock(_token_lock_fd, fcntl.LOCK_UN)
-            except Exception:
-                pass
-            try:
-                os.close(_token_lock_fd)
-            except Exception:
-                pass
-    finally:
-        _token_lock_fd = None
-
 if __name__ == '__main__':
     # Menambahkan penanganan sinyal sistem (SIGTERM)
     signal.signal(signal.SIGTERM, handle_signal)
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutdown manual (Ctrl+C) terdeteksi untuk bot utama.")
+        logger.info("Shutdown manual (Ctrl+C) atau dari sistem terdeteksi untuk bot utama.")
         shutdown_event.set()
-        
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Program exited cleanly.")
-        
