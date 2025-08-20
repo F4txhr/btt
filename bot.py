@@ -38,7 +38,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
-    JSONPersistence,
+    PicklePersistence,
     JobQueue,
     ApplicationHandlerStop,
 )
@@ -2008,7 +2008,7 @@ async def main() -> None:
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .persistence(JSONPersistence(filepath="bot_persistence.json"))
+        .persistence(PicklePersistence(filepath="bot_persistence.pkl"))
         .build()
     )
     
@@ -2153,21 +2153,6 @@ async def main() -> None:
             logger.info("Memulai shutdown bot utama...")
             if application.updater and application.updater.running:
                 await application.updater.stop()
-
-            # Sanitize user_data before saving to JSON
-            try:
-                def _sanitize(val, depth=0):
-                    if depth > 5: return None
-                    if isinstance(val, (str, int, float, bool, type(None))): return val
-                    if isinstance(val, list): return [_sanitize(v, depth + 1) for v in val]
-                    if isinstance(val, tuple): return tuple(_sanitize(v, depth + 1) for v in val) # JSONPersistence converts tuples to lists
-                    if isinstance(val, dict): return {k: _sanitize(v, depth + 1) for k, v in val.items()}
-                    # For any other type that is not directly JSON serializable, return None
-                    return None
-                for uid in list(application.user_data.keys()):
-                    application.user_data[uid] = _sanitize(application.user_data[uid])
-            except Exception as e:
-                logger.error(f"Error sanitizing user_data: {e}")
 
             if application.running:
                 await application.stop()
