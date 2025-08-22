@@ -1,3 +1,132 @@
 <resources>
-    <string name="app_name">AudioPlayerPro</string>
+    <string name="app_name">Audio Player Pro</string>
+    
+    <!-- Navigation -->
+    <string name="nav_player">Player</string>
+    <string name="nav_equalizer">Equalizer</string>
+    <string name="nav_visualizer">Visualizer</string>
+    <string name="nav_mixer">Mixer</string>
+    <string name="nav_settings">Settings</string>
+    
+    <!-- Player -->
+    <string name="player_play">Play</string>
+    <string name="player_pause">Pause</string>
+    <string name="player_stop">Stop</string>
+    <string name="player_previous">Previous</string>
+    <string name="player_next">Next</string>
+    <string name="player_volume">Volume</string>
+    <string name="player_no_track">No track selected</string>
+    
+    <!-- Equalizer -->
+    <string name="equalizer_title">Equalizer</string>
+    <string name="equalizer_enable">Enable Equalizer</string>
+    <string name="equalizer_graphic">Graphic Equalizer (10-Band)</string>
+    <string name="equalizer_parametric">Parametric Equalizer</string>
+    <string name="equalizer_reset">Reset to Flat</string>
+    <string name="equalizer_presets">Presets</string>
+    <string name="equalizer_free_presets">Free Presets</string>
+    <string name="equalizer_pro_presets">Pro Presets</string>
+    
+    <!-- Visualizer -->
+    <string name="visualizer_title">Visualizer</string>
+    <string name="visualizer_spectrum">Spectrum Analyzer</string>
+    <string name="visualizer_waveform">Waveform</string>
+    <string name="visualizer_settings">Visualizer Settings</string>
+    <string name="visualizer_smoothing">Smoothing</string>
+    <string name="visualizer_sensitivity">Sensitivity</string>
+    
+    <!-- Mixer -->
+    <string name="mixer_title">Stem Mixer</string>
+    <string name="mixer_select_file">Select Audio File</string>
+    <string name="mixer_choose_file">Choose Audio File</string>
+    <string name="mixer_selected">Selected: %s</string>
+    <string name="mixer_separation">Stem Separation</string>
+    <string name="mixer_processing">Processing… %d%%</string>
+    <string name="mixer_separate_stems">Separate Stems</string>
+    <string name="mixer_stem_mixer">Stem Mixer</string>
+    <string name="mixer_vocals">Vocals</string>
+    <string name="mixer_drums">Drums</string>
+    <string name="mixer_bass">Bass</string>
+    <string name="mixer_guitar">Guitar</string>
+    <string name="mixer_other">Other</string>
+    <string name="mixer_mute">Mute</string>
+    <string name="mixer_unmute">Unmute</string>
+    <string name="mixer_solo">Solo</string>
+    <string name="mixer_unsolo">Unsolo</string>
+    <string name="mixer_export">Export</string>
+    <string name="mixer_export_wav">Export as WAV</string>
+    <string name="mixer_export_flac">Export as FLAC</string>
+    <string name="mixer_export_description">Export your mixed stems in high-quality formats</string>
+    
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_pro_user">Pro User</string>
+    <string name="settings_free_user">Free User</string>
+    <string name="settings_pro_access">You have access to all Pro features</string>
+    <string name="settings_upgrade_prompt">Upgrade to unlock Pro features</string>
+    <string name="settings_upgrade_pro">Upgrade to Pro</string>
+    <string name="settings_audio">Audio Settings</string>
+    <string name="settings_high_res">High-Resolution Audio</string>
+    <string name="settings_high_res_desc">192 kHz, 32-bit float output</string>
+    <string name="settings_high_res_unsupported">High-resolution audio not supported on this device</string>
+    <string name="settings_supported_formats">Supported Formats</string>
+    <string name="settings_app">App Settings</string>
+    <string name="settings_theme">Theme</string>
+    <string name="settings_theme_dark">Dark</string>
+    <string name="settings_auto_play">Auto-play next track</string>
+    <string name="settings_crossfade">Crossfade between tracks</string>
+    <string name="settings_about">About</string>
+    <string name="settings_version">Version</string>
+    <string name="settings_build">Build</string>
+    <string name="settings_developer">Developer</string>
+    <string name="settings_privacy_policy">Privacy Policy</string>
+    <string name="settings_terms">Terms of Service</string>
+    
+    <!-- Pro Features -->
+    <string name="pro_feature">PRO FEATURE</string>
+    <string name="pro_parametric_eq">Parametric Equalizer</string>
+    <string name="pro_parametric_eq_desc">Advanced parametric EQ with unlimited bands, low/high shelf filters, and precise frequency control.</string>
+    <string name="pro_advanced_dsp">Advanced DSP</string>
+    <string name="pro_advanced_dsp_desc">Preamp, limiter, compressor, and advanced audio processing controls.</string>
+    <string name="pro_stem_separation">Stem Separation &amp; Mixer</string>
+    <string name="pro_stem_separation_desc">Separate any song into individual stems (vocals, drums, bass, guitar, other) and mix them with professional controls.</string>
+    
+    <!-- Common -->
+    <string name="common_back">Back</string>
+    <string name="common_ok">OK</string>
+    <string name="common_cancel">Cancel</string>
+    <string name="common_save">Save</string>
+    <string name="common_delete">Delete</string>
+    <string name="common_edit">Edit</string>
+    <string name="common_add">Add</string>
+    <string name="common_remove">Remove</string>
+    <string name="common_enable">Enable</string>
+    <string name="common_disable">Disable</string>
+    <string name="common_on">On</string>
+    <string name="common_off">Off</string>
+    <string name="common_loading">Loading…</string>
+    <string name="common_error">Error</string>
+    <string name="common_success">Success</string>
+    <string name="common_warning">Warning</string>
+    <string name="common_info">Information</string>
+    
+    <!-- Audio Formats -->
+    <string name="format_flac">FLAC</string>
+    <string name="format_wav">WAV</string>
+    <string name="format_mp3">MP3</string>
+    <string name="format_aac">AAC</string>
+    <string name="format_ogg">OGG</string>
+    <string name="format_dsd">DSD</string>
+    
+    <!-- Frequencies -->
+    <string name="freq_31">31</string>
+    <string name="freq_62">62</string>
+    <string name="freq_125">125</string>
+    <string name="freq_250">250</string>
+    <string name="freq_500">500</string>
+    <string name="freq_1k">1k</string>
+    <string name="freq_2k">2k</string>
+    <string name="freq_4k">4k</string>
+    <string name="freq_8k">8k</string>
+    <string name="freq_16k">16k</string>
 </resources>
