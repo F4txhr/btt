@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 rootProject.name = "AudioPlayerPro"
 include(":app")
 include(":audio-core")
+include(":audio-ml")

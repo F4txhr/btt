@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <!-- Include shared preferences -->
+        <include domain="sharedpref" path="."/>
+        
+        <!-- Include database files -->
+        <include domain="database" path="."/>
+        
+        <!-- Include external files -->
+        <include domain="external" path="stems/"/>
+        <include domain="external" path="exports/"/>
+        
+        <!-- Exclude temporary files -->
+        <exclude domain="external" path="temp/"/>
+        <exclude domain="external" path="cache/"/>
+    </cloud-backup>
+    
+    <device-transfer>
+        <!-- Include shared preferences -->
+        <include domain="sharedpref" path="."/>
+        
+        <!-- Include database files -->
+        <include domain="database" path="."/>
+        
+        <!-- Include external files -->
+        <include domain="external" path="stems/"/>
+        <include domain="external" path="exports/"/>
+        
+        <!-- Exclude temporary files -->
+        <exclude domain="external" path="temp/"/>
+        <exclude domain="external" path="cache/"/>
+    </device-transfer>
+</data-extraction-rules>
